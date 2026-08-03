@@ -1,14 +1,16 @@
 //! `#[obj::methods]` — the behaviour half of a class declaration.
 //!
-//! Dispatch works by forwarding each interface method to a *reserved* inherent name,
-//! `__obj_own_<method>`, with method-call syntax. Autoderef climbs the base chain and stops at the
-//! first class that defines it — the most-derived override — which is exactly C++ virtual
-//! dispatch, and it means a class never needs to know which ancestor last overrode a method.
+//! Every method becomes an inherent method on the class, which is what a `super` call resolves to
+//! (`Shape::scale(self, k)`) and what a static `&Circle` view dispatches to.
 //!
-//! The reserved name is essential. Forwarding to the public name instead (`self.area()`) resolves
-//! to the *trait* method at the very first step, because trait methods are considered before
-//! autoderef moves on, and the interface method would call itself forever. No trait declares
-//! `__obj_own_*`, so that lookup can only ever find an inherent method.
+//! Virtual dispatch is then wired up by *delegation* rather than by name lookup: for each ancestor
+//! interface, a class emits one impl in which every method either calls this class's own inherent
+//! override or hands off to the base that provides it.
+//!
+//! Resolving this structurally matters twice over. Autoderef only ever walks the primary base
+//! chain, so a lookup-based scheme can never reach a secondary base's methods; and delegation
+//! bottoms out at an inherent method that does not exist when a pure virtual was never overridden,
+//! turning that mistake into a compile error.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -38,7 +40,7 @@ impl Parse for MethodsInput {
 }
 
 /// How a method participates in dispatch.
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum Kind {
     /// Ordinary method: inherited through `Deref`, never dispatched virtually.
     Plain,
@@ -61,12 +63,12 @@ fn classify(f: &TraitItemFn) -> syn::Result<Kind> {
                 kind = Kind::Virtual;
             } else if look.peek(Token![override]) {
                 input.parse::<Token![override]>()?;
-                // An optional `override(Base)` is accepted and ignored: dispatch resolves by
-                // method-call syntax, so naming the declaring class is documentation only.
+                // `override(Base)` is accepted and ignored: the declaring class is found
+                // structurally, so naming it is documentation only.
                 if input.peek(syn::token::Paren) {
-                    let _inner;
-                    syn::parenthesized!(_inner in input);
-                    let _ = _inner.parse::<TokenStream>()?;
+                    let inner;
+                    syn::parenthesized!(inner in input);
+                    let _ = inner.parse::<TokenStream>()?;
                 }
                 kind = Kind::Override;
             } else {
@@ -78,41 +80,22 @@ fn classify(f: &TraitItemFn) -> syn::Result<Kind> {
     Ok(kind)
 }
 
-/// `area` -> `__obj_own_area`, the reserved inherent name interface methods forward to.
-fn own_name(name: &Ident) -> Ident {
-    Ident::new(&format!("__obj_own_{name}"), name.span())
-}
-
 /// Strips `#[obj(..)]` markers, leaving doc comments and other attributes intact.
 fn strip_obj_attrs(f: &mut TraitItemFn) {
     f.attrs.retain(|a| !a.path().is_ident("obj"));
 }
 
-/// The names of a method's parameters, for building a forwarding call.
-fn arg_names(f: &TraitItemFn) -> syn::Result<Vec<Ident>> {
-    let mut names = Vec::new();
-    for arg in &f.sig.inputs {
-        match arg {
-            FnArg::Receiver(_) => {}
-            FnArg::Typed(t) => match &*t.pat {
-                Pat::Ident(p) => names.push(p.ident.clone()),
-                other => {
-                    return Err(syn::Error::new(
-                        other.span(),
-                        "obj: virtual methods need plain identifier parameters",
-                    ))
-                }
-            },
-        }
-    }
-    Ok(names)
-}
-
 fn check_dispatchable(f: &TraitItemFn) -> syn::Result<()> {
-    if f.sig.receiver().is_none() {
+    let Some(receiver) = f.sig.receiver() else {
         return Err(syn::Error::new(
             f.sig.span(),
             "obj: a virtual method needs a `self` receiver",
+        ));
+    };
+    if receiver.reference.is_none() {
+        return Err(syn::Error::new(
+            receiver.span(),
+            "obj: a virtual method must take `&self` or `&mut self`, not `self` by value",
         ));
     }
     if !f.sig.generics.params.is_empty() {
@@ -128,18 +111,28 @@ fn check_dispatchable(f: &TraitItemFn) -> syn::Result<()> {
             "obj: virtual methods cannot be `async`, because the interface must stay object-safe",
         ));
     }
+    for arg in &f.sig.inputs {
+        if let FnArg::Typed(t) = arg {
+            if !matches!(&*t.pat, Pat::Ident(_)) {
+                return Err(syn::Error::new(
+                    t.pat.span(),
+                    "obj: virtual methods need plain identifier parameters",
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
 pub fn expand(input: MethodsInput) -> syn::Result<TokenStream> {
     let class = input.self_ty;
-    let iface = iface_trait(&class);
     let iface_mac = iface_macro(&class);
     let ancestors_mac = ancestors_macro(&class);
 
     let mut inherent = Vec::new();
     let mut virtual_sigs = Vec::new();
-    let mut forwards = Vec::new();
+    // Methods this class implements itself: its own new virtuals plus anything it overrides.
+    let mut provided = Vec::new();
 
     for item in input.items {
         let kind = classify(&item)?;
@@ -152,63 +145,30 @@ pub fn expand(input: MethodsInput) -> syn::Result<TokenStream> {
 
         let sig = item.sig.clone();
         let attrs = item.attrs.clone();
-        let name = sig.ident.clone();
 
-        if kind == Kind::Plain {
-            let Some(body) = &item.default else {
+        match &item.default {
+            Some(body) => inherent.push(quote! { #(#attrs)* pub #sig #body }),
+            None if kind == Kind::Virtual => {
+                // A pure virtual: deliberately no inherent method, so a concrete class that
+                // never overrides it fails to compile.
+            }
+            None => {
                 return Err(syn::Error::new(
                     sig.span(),
                     "obj: a method without a body must be marked `#[obj(virtual)]`",
-                ));
-            };
-            inherent.push(quote! { #(#attrs)* pub #sig #body });
-        } else {
-            // The reserved name autoderef will search for. Only classes that declare or override
-            // the method define it, so the search lands on the most-derived implementation.
-            let own = own_name(&name);
-            let mut own_sig = sig.clone();
-            own_sig.ident = own.clone();
-            let names = arg_names(&item)?;
-
-            match &item.default {
-                Some(body) => {
-                    inherent.push(quote! { #(#attrs)* pub #sig #body });
-                    inherent.push(quote! {
-                        #[doc(hidden)]
-                        #[inline]
-                        pub #own_sig { Self::#name(self #(, #names)*) }
-                    });
-                }
-                None => {
-                    if kind != Kind::Virtual {
-                        return Err(syn::Error::new(
-                            sig.span(),
-                            "obj: a method without a body must be marked `#[obj(virtual)]`",
-                        ));
-                    }
-                    // A pure virtual. The placeholder is what a concrete subclass that forgets to
-                    // override it will resolve to, turning silent infinite recursion into a
-                    // deprecation warning plus a clear panic.
-                    let msg = format!("obj: pure virtual `{class}::{name}` was never overridden");
-                    let dep = format!(
-                        "obj: pure virtual `{class}::{name}` has no override in this class",
-                    );
-                    inherent.push(quote! {
-                        #(#attrs)*
-                        #[doc(hidden)]
-                        #[deprecated(note = #dep)]
-                        pub #own_sig { ::core::panic!(#msg) }
-                    });
-                }
+                ))
             }
+        }
 
-            if kind == Kind::Virtual {
+        match kind {
+            Kind::Virtual => {
                 virtual_sigs.push(quote! { #sig ; });
-                forwards.push(quote! {
-                    #[inline]
-                    #sig { self.#own(#(#names),*) }
-                });
+                if item.default.is_some() {
+                    provided.push(sig.ident.clone());
+                }
             }
+            Kind::Override => provided.push(sig.ident.clone()),
+            Kind::Plain => {}
         }
     }
 
@@ -217,17 +177,23 @@ pub fn expand(input: MethodsInput) -> syn::Result<TokenStream> {
             #(#inherent)*
         }
 
-        // Implements this class's interface for any subclass.
+        // Implements this class's interface for some class `$d`. `$delegate` names the base that
+        // non-overridden methods are handed to; `$ov` lists what `$d` implements itself.
         #[doc(hidden)]
         #[macro_export]
         macro_rules! #iface_mac {
-            ($d:ty) => {
-                impl #iface for $d {
-                    #(#forwards)*
+            ($d:ident, $delegate:tt, [$($ov:ident)*]) => {
+                ::obj::__obj_emit! {
+                    iface #class for $d delegate $delegate overrides [$($ov)*]
+                    methods { #(#virtual_sigs)* }
                 }
             };
         }
 
-        #ancestors_mac! { {methods #class { #(#virtual_sigs)* }} [] }
+        #ancestors_mac! {
+            {methods #class { #(#virtual_sigs)* } provides [#(#provided)*]}
+            []
+            []
+        }
     })
 }

@@ -183,6 +183,21 @@ impl BaseTable {
         self
     }
 
+    /// Appends every entry of `other`.
+    ///
+    /// Used for multiple inheritance, where a class merges one table per base. A class reachable
+    /// through two different bases appears twice; lookups take the first, which is the one found
+    /// along the primary chain.
+    #[must_use]
+    pub const fn concat(mut self, other: BaseTable) -> Self {
+        let mut i = 0;
+        while i < other.len {
+            self = self.push(other.entries[i]);
+            i += 1;
+        }
+        self
+    }
+
     /// Copies an existing table, dropping every vtable.
     ///
     /// Used for abstract classes, which implement no interface and so have no vtables to record.
