@@ -1,0 +1,27 @@
+[package]
+name = "obj"
+description = "C++-style inheritance for Rust: virtual functions, multiple inheritance, virtual bases and dynamic casts"
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+obj-macros = { workspace = true }
+
+[features]
+default = ["std"]
+# Enables `std`-only conveniences. The crate is `no_std + alloc` without it.
+std = []
+# Uses `core::ptr::from_raw_parts` instead of a transmute to rebuild fat pointers.
+nightly = []
+
+[dev-dependencies]
+trybuild = "1.0"
+
+[lints]
+workspace = true

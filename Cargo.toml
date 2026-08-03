@@ -1,0 +1,25 @@
+[workspace]
+members = ["obj", "obj-macros"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cxcubehd/obj-rs"
+keywords = ["inheritance", "oop", "polymorphism", "class", "virtual"]
+categories = ["rust-patterns", "no-std"]
+
+[workspace.dependencies]
+obj-macros = { version = "0.1.0", path = "obj-macros" }
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
