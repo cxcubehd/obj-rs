@@ -90,7 +90,8 @@ pub fn expand(args: ClassArgs, mut item: ItemStruct) -> syn::Result<TokenStream>
         };
         for base in args.bases.iter().rev() {
             let f = base_field(base);
-            let field: Field = syn::parse_quote!(#vis #f: #base);
+            let doc = format!("The `{base}` base subobject.");
+            let field: Field = syn::parse_quote!(#[doc = #doc] #vis #f: #base);
             named.named.insert(0, field);
         }
     }
