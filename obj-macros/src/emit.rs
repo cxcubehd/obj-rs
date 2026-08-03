@@ -454,6 +454,14 @@ fn expand_class(
                 fn up_mut<'a>(
                     this: &'a mut (dyn #iface + 'static),
                 ) -> &'a mut (dyn #anc_iface + 'static) { this }
+                #[inline]
+                fn up_rc(
+                    this: ::obj::__private::Rc<dyn #iface>,
+                ) -> ::obj::__private::Rc<dyn #anc_iface> { this }
+                #[inline]
+                fn up_arc(
+                    this: ::obj::__private::Arc<dyn #iface + Send + Sync>,
+                ) -> ::obj::__private::Arc<dyn #anc_iface + Send + Sync> { this }
             }
         }
     });
@@ -469,6 +477,17 @@ fn expand_class(
                 fn as_dyn(value: &#class) -> &(dyn #iface + 'static) { value }
                 #[inline]
                 fn as_dyn_mut(value: &mut #class) -> &mut (dyn #iface + 'static) { value }
+                #[inline]
+                fn rc_into_dyn(
+                    value: ::obj::__private::Rc<#class>,
+                ) -> ::obj::__private::Rc<dyn #iface> { value }
+                #[inline]
+                fn arc_into_dyn(
+                    value: ::obj::__private::Arc<#class>,
+                ) -> ::obj::__private::Arc<dyn #iface + Send + Sync>
+                where
+                    #class: Send + Sync,
+                { value }
             }
         }
     });
@@ -504,6 +523,18 @@ fn expand_class(
             fn deref_mut(&mut self) -> &mut #class { self.#sub_fn_mut() }
         }
 
+        // `dyn X + Send + Sync` is a distinct type from `dyn X`, so the thread-safe interface
+        // that `ArcShared` stores needs its own field access.
+        impl ::obj::__private::Deref for dyn #iface + Send + Sync {
+            type Target = #class;
+            #[inline]
+            fn deref(&self) -> &#class { self.#sub_fn() }
+        }
+        impl ::obj::__private::DerefMut for dyn #iface + Send + Sync {
+            #[inline]
+            fn deref_mut(&mut self) -> &mut #class { self.#sub_fn_mut() }
+        }
+
         unsafe impl ::obj::AnyObj for #class {
             #[inline]
             fn class_meta(&self) -> &'static ::obj::ClassMeta { &#meta }
@@ -523,8 +554,13 @@ fn expand_class(
 
         unsafe impl ::obj::Class for #class {
             type Dyn = dyn #iface;
+            type SendDyn = dyn #iface + Send + Sync;
             type Complete = #class;
             const META: &'static ::obj::ClassMeta = &#meta;
+            #[inline]
+            fn send_as_dyn<'a>(
+                value: &'a (dyn #iface + Send + Sync + 'static),
+            ) -> &'a (dyn #iface + 'static) { value }
         }
 
         #[doc(hidden)]

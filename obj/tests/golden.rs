@@ -17,6 +17,9 @@
 use core::any::TypeId;
 use core::ops::{Deref, DerefMut};
 
+use std::rc::Rc;
+use std::sync::Arc;
+
 use obj::{AnyObj, BaseEntry, Class, ClassMeta, Concrete, Obj, Ref, SubclassOf};
 
 // =====================================================================================
@@ -73,6 +76,7 @@ impl Shape {
 // Abstract: no `Concrete` impl, and every vtable slot is `None`.
 unsafe impl Class for Shape {
     type Dyn = dyn ShapeDyn;
+    type SendDyn = dyn ShapeDyn + Send + Sync;
     type Complete = Shape;
     const META: &'static ClassMeta = &ClassMeta {
         name: "Shape",
@@ -83,6 +87,12 @@ unsafe impl Class for Shape {
             dyn_vtable: None,
         }],
     };
+
+    fn send_as_dyn<'a>(
+        value: &'a (dyn ShapeDyn + Send + Sync + 'static),
+    ) -> &'a (dyn ShapeDyn + 'static) {
+        value
+    }
 }
 
 unsafe impl SubclassOf<Shape> for Shape {
@@ -93,6 +103,12 @@ unsafe impl SubclassOf<Shape> for Shape {
         this
     }
     fn up_mut<'a>(this: &'a mut (dyn ShapeDyn + 'static)) -> &'a mut (dyn ShapeDyn + 'static) {
+        this
+    }
+    fn up_rc(this: Rc<dyn ShapeDyn>) -> Rc<dyn ShapeDyn> {
+        this
+    }
+    fn up_arc(this: Arc<dyn ShapeDyn + Send + Sync>) -> Arc<dyn ShapeDyn + Send + Sync> {
         this
     }
 }
@@ -141,6 +157,7 @@ impl Drawable {
 
 unsafe impl Class for Drawable {
     type Dyn = dyn DrawableDyn;
+    type SendDyn = dyn DrawableDyn + Send + Sync;
     type Complete = Drawable;
     const META: &'static ClassMeta = &ClassMeta {
         name: "Drawable",
@@ -151,6 +168,12 @@ unsafe impl Class for Drawable {
             dyn_vtable: None,
         }],
     };
+
+    fn send_as_dyn<'a>(
+        value: &'a (dyn DrawableDyn + Send + Sync + 'static),
+    ) -> &'a (dyn DrawableDyn + 'static) {
+        value
+    }
 }
 
 // =====================================================================================
@@ -275,6 +298,7 @@ impl CircleDyn for Circle {
 
 unsafe impl Class for Circle {
     type Dyn = dyn CircleDyn;
+    type SendDyn = dyn CircleDyn + Send + Sync;
     type Complete = Circle;
     const META: &'static ClassMeta = &ClassMeta {
         name: "Circle",
@@ -297,6 +321,12 @@ unsafe impl Class for Circle {
             },
         ],
     };
+
+    fn send_as_dyn<'a>(
+        value: &'a (dyn CircleDyn + Send + Sync + 'static),
+    ) -> &'a (dyn CircleDyn + 'static) {
+        value
+    }
 }
 
 unsafe impl Concrete for Circle {
@@ -307,6 +337,15 @@ unsafe impl Concrete for Circle {
         value
     }
     fn as_dyn_mut(value: &mut Circle) -> &mut (dyn CircleDyn + 'static) {
+        value
+    }
+    fn rc_into_dyn(value: Rc<Circle>) -> Rc<dyn CircleDyn> {
+        value
+    }
+    fn arc_into_dyn(value: Arc<Circle>) -> Arc<dyn CircleDyn + Send + Sync>
+    where
+        Circle: Send + Sync,
+    {
         value
     }
 }
@@ -321,6 +360,12 @@ unsafe impl SubclassOf<Circle> for Circle {
     fn up_mut<'a>(this: &'a mut (dyn CircleDyn + 'static)) -> &'a mut (dyn CircleDyn + 'static) {
         this
     }
+    fn up_rc(this: Rc<dyn CircleDyn>) -> Rc<dyn CircleDyn> {
+        this
+    }
+    fn up_arc(this: Arc<dyn CircleDyn + Send + Sync>) -> Arc<dyn CircleDyn + Send + Sync> {
+        this
+    }
 }
 
 unsafe impl SubclassOf<Shape> for Circle {
@@ -333,6 +378,12 @@ unsafe impl SubclassOf<Shape> for Circle {
     fn up_mut<'a>(this: &'a mut (dyn CircleDyn + 'static)) -> &'a mut (dyn ShapeDyn + 'static) {
         this
     }
+    fn up_rc(this: Rc<dyn CircleDyn>) -> Rc<dyn ShapeDyn> {
+        this
+    }
+    fn up_arc(this: Arc<dyn CircleDyn + Send + Sync>) -> Arc<dyn ShapeDyn + Send + Sync> {
+        this
+    }
 }
 
 unsafe impl SubclassOf<Drawable> for Circle {
@@ -343,6 +394,12 @@ unsafe impl SubclassOf<Drawable> for Circle {
         this
     }
     fn up_mut<'a>(this: &'a mut (dyn CircleDyn + 'static)) -> &'a mut (dyn DrawableDyn + 'static) {
+        this
+    }
+    fn up_rc(this: Rc<dyn CircleDyn>) -> Rc<dyn DrawableDyn> {
+        this
+    }
+    fn up_arc(this: Arc<dyn CircleDyn + Send + Sync>) -> Arc<dyn DrawableDyn + Send + Sync> {
         this
     }
 }
@@ -445,6 +502,7 @@ impl SquareDyn for Square {
 
 unsafe impl Class for Square {
     type Dyn = dyn SquareDyn;
+    type SendDyn = dyn SquareDyn + Send + Sync;
     type Complete = Square;
     const META: &'static ClassMeta = &ClassMeta {
         name: "Square",
@@ -462,6 +520,12 @@ unsafe impl Class for Square {
             },
         ],
     };
+
+    fn send_as_dyn<'a>(
+        value: &'a (dyn SquareDyn + Send + Sync + 'static),
+    ) -> &'a (dyn SquareDyn + 'static) {
+        value
+    }
 }
 
 unsafe impl Concrete for Square {
@@ -474,6 +538,15 @@ unsafe impl Concrete for Square {
     fn as_dyn_mut(value: &mut Square) -> &mut (dyn SquareDyn + 'static) {
         value
     }
+    fn rc_into_dyn(value: Rc<Square>) -> Rc<dyn SquareDyn> {
+        value
+    }
+    fn arc_into_dyn(value: Arc<Square>) -> Arc<dyn SquareDyn + Send + Sync>
+    where
+        Square: Send + Sync,
+    {
+        value
+    }
 }
 
 unsafe impl SubclassOf<Shape> for Square {
@@ -484,6 +557,12 @@ unsafe impl SubclassOf<Shape> for Square {
         this
     }
     fn up_mut<'a>(this: &'a mut (dyn SquareDyn + 'static)) -> &'a mut (dyn ShapeDyn + 'static) {
+        this
+    }
+    fn up_rc(this: Rc<dyn SquareDyn>) -> Rc<dyn ShapeDyn> {
+        this
+    }
+    fn up_arc(this: Arc<dyn SquareDyn + Send + Sync>) -> Arc<dyn ShapeDyn + Send + Sync> {
         this
     }
 }

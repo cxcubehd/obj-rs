@@ -5,6 +5,8 @@
 #![allow(missing_docs)]
 
 pub use alloc::boxed::Box;
+pub use alloc::rc::Rc;
+pub use alloc::sync::Arc;
 pub use core::any::TypeId;
 pub use core::mem::offset_of;
 pub use core::ops::{Deref, DerefMut};

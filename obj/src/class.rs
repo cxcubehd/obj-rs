@@ -4,6 +4,8 @@
 //! hand, and several are `unsafe` to implement because the cast machinery trusts them.
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
+use alloc::sync::Arc;
 
 use crate::meta::ClassMeta;
 
@@ -37,6 +39,13 @@ pub unsafe trait Class: 'static {
     /// Polymorphic handles ([`Obj`](crate::Obj), [`Ref`](crate::Ref)) store a pointer to this.
     type Dyn: ?Sized + AnyObj;
 
+    /// The same interface, plus `Send + Sync`.
+    ///
+    /// Auto traits are part of a trait object's type, so `dyn Shape` is never `Send` however
+    /// thread-safe the underlying class is. [`ArcShared`](crate::ArcShared) stores this variant
+    /// instead, which is why sharing an object across threads is expressible at all.
+    type SendDyn: ?Sized + AnyObj + Send + Sync;
+
     /// The type that owns a complete object of this class.
     ///
     /// This is `Self` for ordinary classes. Classes with virtual bases use a generated wrapper
@@ -46,6 +55,12 @@ pub unsafe trait Class: 'static {
 
     /// This class's runtime metadata.
     const META: &'static ClassMeta;
+
+    /// Views the thread-safe interface as the plain one, dropping the auto-trait bounds.
+    ///
+    /// Sound in one direction only, and needed because generic code cannot see that
+    /// `Self::SendDyn` and `Self::Dyn` are the same trait with different auto traits.
+    fn send_as_dyn(value: &Self::SendDyn) -> &Self::Dyn;
 }
 
 /// A class that can actually be instantiated.
@@ -72,6 +87,14 @@ pub unsafe trait Concrete: Class {
 
     /// Mutably borrows a complete object as this class's interface.
     fn as_dyn_mut(value: &mut Self::Complete) -> &mut Self::Dyn;
+
+    /// Coerces a reference-counted complete object to this class's interface.
+    fn rc_into_dyn(value: Rc<Self::Complete>) -> Rc<Self::Dyn>;
+
+    /// Coerces an atomically reference-counted complete object to the thread-safe interface.
+    fn arc_into_dyn(value: Arc<Self::Complete>) -> Arc<Self::SendDyn>
+    where
+        Self::Complete: Send + Sync;
 }
 
 /// `Self` derives from `B` (or *is* `B`).
@@ -92,4 +115,10 @@ pub unsafe trait SubclassOf<B: Class>: Class {
 
     /// Upcasts a mutable reference.
     fn up_mut(this: &mut Self::Dyn) -> &mut B::Dyn;
+
+    /// Upcasts a reference-counted handle.
+    fn up_rc(this: Rc<Self::Dyn>) -> Rc<B::Dyn>;
+
+    /// Upcasts an atomically reference-counted handle.
+    fn up_arc(this: Arc<Self::SendDyn>) -> Arc<B::SendDyn>;
 }

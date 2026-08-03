@@ -56,7 +56,7 @@ pub mod meta;
 pub mod __private;
 
 pub use class::{AnyObj, Class, Concrete, SubclassOf};
-pub use handle::{Obj, Ref, RefMut};
+pub use handle::{ArcShared, Obj, Ref, RefMut, Shared, WeakArcShared, WeakShared};
 pub use meta::{BaseEntry, BaseTable, ClassId, ClassMeta, VTablePtr, MAX_BASES};
 #[doc(hidden)]
 pub use obj_macros::__obj_emit;

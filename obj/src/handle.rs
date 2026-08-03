@@ -9,6 +9,8 @@
 //! unrepresentable.
 
 use alloc::boxed::Box;
+use alloc::rc::{Rc, Weak as RcWeak};
+use alloc::sync::{Arc, Weak as ArcWeak};
 use core::ops::{Deref, DerefMut};
 
 use crate::cast::{data_ptr_of, dyn_ptr_of, is_a};
@@ -279,5 +281,214 @@ impl<C: Class> Deref for RefMut<'_, C> {
 impl<C: Class> DerefMut for RefMut<'_, C> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.0
+    }
+}
+
+/// A reference-counted polymorphic handle — the `obj` analogue of C++'s `shared_ptr<C>`.
+///
+/// Single-threaded. For an object graph shared across threads, use [`ArcShared`].
+pub struct Shared<C: Class>(Rc<C::Dyn>);
+
+impl<C: Class> Shared<C> {
+    /// Allocates a new shared object.
+    pub fn new(value: C::Complete) -> Self
+    where
+        C: Concrete,
+    {
+        Self(C::rc_into_dyn(Rc::new(value)))
+    }
+
+    /// Borrows this object as a polymorphic reference.
+    #[must_use]
+    pub fn borrow(&self) -> Ref<'_, C> {
+        Ref::from_dyn(&*self.0)
+    }
+
+    /// Metadata for this object's most-derived class.
+    #[must_use]
+    pub fn class(&self) -> &'static ClassMeta {
+        crate::class::AnyObj::class_meta(&*self.0)
+    }
+
+    /// Upcasts to a base class. Compile-time checked and free.
+    #[must_use]
+    pub fn upcast<B: Class>(self) -> Shared<B>
+    where
+        C: SubclassOf<B>,
+    {
+        Shared(C::up_rc(self.0))
+    }
+
+    /// Returns whether this object's most-derived class is, or derives from, `T`.
+    #[must_use]
+    pub fn is<T: Class>(&self) -> bool {
+        is_a::<T, _>(&*self.0)
+    }
+
+    /// Creates a non-owning handle to this object.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakShared<C> {
+        WeakShared(Rc::downgrade(&self.0))
+    }
+
+    /// Number of strong handles to this object.
+    #[must_use]
+    pub fn strong_count(&self) -> usize {
+        Rc::strong_count(&self.0)
+    }
+
+    /// Attempts to downcast, returning the original handle on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
+    pub fn downcast<T: Class>(self) -> Result<Shared<T>, Self> {
+        let Some(ptr) = dyn_ptr_of::<T, _>(&*self.0) else {
+            return Err(self);
+        };
+        let _ = Rc::into_raw(self.0);
+        // SAFETY: `ptr` addresses the same allocation, and its vtable belongs to the same
+        // most-derived type, so the layout recovered from it is the one the `Rc` was built with.
+        Ok(Shared(unsafe { Rc::from_raw(ptr) }))
+    }
+}
+
+impl<C: Class> Clone for Shared<C> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<C: Class> Deref for Shared<C> {
+    type Target = C::Dyn;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// A non-owning handle to a [`Shared`] object.
+pub struct WeakShared<C: Class>(RcWeak<C::Dyn>);
+
+impl<C: Class> WeakShared<C> {
+    /// Upgrades to a strong handle, unless the object has been dropped.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<Shared<C>> {
+        self.0.upgrade().map(Shared)
+    }
+}
+
+impl<C: Class> Clone for WeakShared<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// A thread-safe reference-counted polymorphic handle.
+///
+/// Stores [`Class::SendDyn`], so constructing one requires the class to be `Send + Sync`.
+pub struct ArcShared<C: Class>(Arc<C::SendDyn>);
+
+impl<C: Class> ArcShared<C> {
+    /// Allocates a new shared object.
+    pub fn new(value: C::Complete) -> Self
+    where
+        C: Concrete,
+        C::Complete: Send + Sync,
+    {
+        Self(C::arc_into_dyn(Arc::new(value)))
+    }
+
+    /// Borrows this object as a polymorphic reference.
+    #[must_use]
+    pub fn borrow(&self) -> Ref<'_, C> {
+        Ref::from_dyn(C::send_as_dyn(&self.0))
+    }
+
+    /// Metadata for this object's most-derived class.
+    #[must_use]
+    pub fn class(&self) -> &'static ClassMeta {
+        crate::class::AnyObj::class_meta(&*self.0)
+    }
+
+    /// Upcasts to a base class. Compile-time checked and free.
+    #[must_use]
+    pub fn upcast<B: Class>(self) -> ArcShared<B>
+    where
+        C: SubclassOf<B>,
+    {
+        ArcShared(C::up_arc(self.0))
+    }
+
+    /// Returns whether this object's most-derived class is, or derives from, `T`.
+    #[must_use]
+    pub fn is<T: Class>(&self) -> bool {
+        is_a::<T, _>(&*self.0)
+    }
+
+    /// Creates a non-owning handle to this object.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakArcShared<C> {
+        WeakArcShared(Arc::downgrade(&self.0))
+    }
+
+    /// Number of strong handles to this object.
+    #[must_use]
+    pub fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
+    /// Attempts to downcast, returning the original handle on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
+    pub fn downcast<T: Class>(self) -> Result<ArcShared<T>, Self> {
+        let meta = crate::class::AnyObj::class_meta(&*self.0);
+        let Some(entry) = meta.find_base(core::any::TypeId::of::<T>()) else {
+            return Err(self);
+        };
+        let Some(vtable) = entry.dyn_vtable else {
+            return Err(self);
+        };
+        let data = crate::class::AnyObj::obj_addr(&*self.0);
+        let _ = Arc::into_raw(self.0);
+        // SAFETY: the rebuilt pointer addresses the same allocation and its vtable belongs to the
+        // same most-derived type, so the layout `Arc::from_raw` recovers is the one the handle was
+        // built with. `Send + Sync` carry over because the concrete type is unchanged.
+        let fat: *const T::SendDyn = unsafe { crate::cast::rebuild_fat(data, vtable) };
+        // SAFETY: as above.
+        Ok(ArcShared(unsafe { Arc::from_raw(fat) }))
+    }
+}
+
+impl<C: Class> Clone for ArcShared<C> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<C: Class> Deref for ArcShared<C> {
+    type Target = C::SendDyn;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// A non-owning handle to an [`ArcShared`] object.
+pub struct WeakArcShared<C: Class>(ArcWeak<C::SendDyn>);
+
+impl<C: Class> WeakArcShared<C> {
+    /// Upgrades to a strong handle, unless the object has been dropped.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<ArcShared<C>> {
+        self.0.upgrade().map(ArcShared)
+    }
+}
+
+impl<C: Class> Clone for WeakArcShared<C> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
