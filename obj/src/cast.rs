@@ -1,7 +1,8 @@
 //! Fat-pointer machinery behind down- and side-casts.
 //!
-//! Everything in here is `pub(crate)`; users reach it through the cast methods on
-//! [`Obj`](crate::Obj), [`Ref`](crate::Ref) and [`RefMut`](crate::RefMut).
+//! Most of this is `pub(crate)`; users reach it through the cast methods on
+//! [`Obj`](crate::Obj), [`Ref`](crate::Ref) and [`RefMut`](crate::RefMut). The `subobject`
+//! helpers are public because generated `Deref` impls call them.
 
 use core::any::TypeId;
 use core::marker::PhantomData;
@@ -75,4 +76,44 @@ pub(crate) fn dyn_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*const
 /// Returns whether `src`'s most-derived class is, or derives from, `T`.
 pub(crate) fn is_a<T: Class, S: AnyObj + ?Sized>(src: &S) -> bool {
     src.class_meta().is_a(TypeId::of::<T>())
+}
+
+/// Borrows the `T` subobject of an object known to derive from `T`.
+///
+/// This is how a polymorphic handle reaches a base class's *fields*: `Deref for dyn TDyn` resolves
+/// the offset through the most-derived class's table. Doing it dynamically is what frees a class
+/// from having to know the layout of ancestors it was never told about.
+///
+/// # Panics
+///
+/// If `src` does not derive from `T`. Generated code only ever calls this where the interface
+/// itself proves the relationship, so this cannot fire from safe user code.
+pub fn subobject<T: Class, S: AnyObj + ?Sized>(src: &S) -> &T {
+    let ptr = data_ptr_of::<T, S>(src).unwrap_or_else(|| {
+        panic!(
+            "obj: `{}` does not derive from `{}`",
+            src.class_meta().name,
+            T::META.name,
+        )
+    });
+    // SAFETY: `data_ptr_of` returns an in-bounds pointer to the live `T` subobject of `src`, whose
+    // borrow we are reusing.
+    unsafe { &*ptr }
+}
+
+/// Mutably borrows the `T` subobject of an object known to derive from `T`.
+///
+/// # Panics
+///
+/// See [`subobject`].
+pub fn subobject_mut<T: Class, S: AnyObj + ?Sized>(src: &mut S) -> &mut T {
+    let ptr = data_ptr_of::<T, S>(src).unwrap_or_else(|| {
+        panic!(
+            "obj: `{}` does not derive from `{}`",
+            src.class_meta().name,
+            T::META.name,
+        )
+    });
+    // SAFETY: as `subobject`, and `src` is borrowed uniquely for the returned lifetime.
+    unsafe { &mut *ptr.cast_mut() }
 }

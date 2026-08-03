@@ -31,9 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.86.0
-      # UI tests pin compiler diagnostics, which drift between versions; the MSRV job only needs
-      # to prove the crate builds and behaves.
-      - run: cargo test --workspace -- --skip ui
+      # The MSRV applies to the library, not to dev-dependencies: `trybuild` itself requires a
+      # newer compiler, so `cargo test` cannot run here. Building proves the crate and everything
+      # its macros generate compile on the oldest supported toolchain.
+      - run: cargo build --workspace
+      - run: cargo build -p obj --no-default-features
 
   no_std:
     name: no_std build

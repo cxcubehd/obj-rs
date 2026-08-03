@@ -115,6 +115,99 @@ impl ClassMeta {
     }
 }
 
+/// Placeholder class used to fill unused [`BaseTable`] slots. Never matches a real class.
+struct Nobody;
+
+impl BaseEntry {
+    /// An entry that matches nothing, used to pad a [`BaseTable`].
+    pub const EMPTY: BaseEntry = BaseEntry {
+        id: TypeId::of::<Nobody>,
+        data_offset: 0,
+        dyn_vtable: None,
+    };
+}
+
+/// Maximum number of classes in one inheritance graph (the class plus all its ancestors).
+pub const MAX_BASES: usize = 24;
+
+/// A base table under construction.
+///
+/// Generated code builds a class's table by taking its base's table, shifting the offsets by
+/// where that base sits, and pushing its own entry. That recursion is what lets a class inherit
+/// entries for ancestors it was never told about: `#[obj::class(extends = Mid)]` names only `Mid`,
+/// yet the resulting table also describes `Mid`'s own ancestors — each entry carrying a vtable
+/// specialised to the *derived* class, so a polymorphic cast to a distant ancestor still reaches
+/// the most-derived override.
+///
+/// The capacity is fixed at [`MAX_BASES`] so that array lengths never depend on a generic
+/// parameter, which would require the unstable `generic_const_exprs` feature.
+#[derive(Clone, Copy, Debug)]
+pub struct BaseTable {
+    /// Entries, of which the first `len` are live.
+    pub entries: [BaseEntry; MAX_BASES],
+    /// Number of live entries.
+    pub len: usize,
+}
+
+impl BaseTable {
+    /// An empty table.
+    pub const EMPTY: BaseTable = BaseTable {
+        entries: [BaseEntry::EMPTY; MAX_BASES],
+        len: 0,
+    };
+
+    /// Appends an entry.
+    ///
+    /// # Panics
+    ///
+    /// At compile time, if the hierarchy exceeds [`MAX_BASES`] classes.
+    #[must_use]
+    pub const fn push(mut self, entry: BaseEntry) -> Self {
+        assert!(
+            self.len < MAX_BASES,
+            "obj: inheritance graph exceeds MAX_BASES classes",
+        );
+        self.entries[self.len] = entry;
+        self.len += 1;
+        self
+    }
+
+    /// Shifts every entry's offset by where this subobject sits inside the derived class.
+    #[must_use]
+    pub const fn offset_by(mut self, delta: usize) -> Self {
+        let mut i = 0;
+        while i < self.len {
+            self.entries[i].data_offset += delta;
+            i += 1;
+        }
+        self
+    }
+
+    /// Copies an existing table, dropping every vtable.
+    ///
+    /// Used for abstract classes, which implement no interface and so have no vtables to record.
+    #[must_use]
+    pub const fn from_slice_without_vtables(src: &[BaseEntry]) -> Self {
+        let mut out = Self::EMPTY;
+        let mut i = 0;
+        while i < src.len() {
+            out = out.push(BaseEntry {
+                id: src[i].id,
+                data_offset: src[i].data_offset,
+                dyn_vtable: None,
+            });
+            i += 1;
+        }
+        out
+    }
+
+    /// The live entries.
+    #[must_use]
+    pub const fn as_slice(&self) -> &[BaseEntry] {
+        self.entries.split_at(self.len).0
+    }
+}
+
 impl PartialEq for ClassMeta {
     fn eq(&self, other: &Self) -> bool {
         self.class_id() == other.class_id()

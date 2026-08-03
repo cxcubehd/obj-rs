@@ -1,0 +1,20 @@
+error[E0277]: `Shape` is an abstract class, so it cannot be instantiated
+  --> tests/ui/abstract_class_is_not_instantiable.rs:16:13
+   |
+16 |     let _ = Obj::<Shape>::new(Shape { x: 1.0 });
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ abstract class
+   |
+help: the trait `Concrete` is not implemented for `Shape`
+  --> tests/ui/abstract_class_is_not_instantiable.rs:5:1
+   |
+ 5 | pub struct Shape {
+   | ^^^^^^^^^^^^^^^^
+   = note: `Shape` has at least one pure virtual method; instantiate a concrete subclass instead
+note: required by a bound in `Obj::<C>::new`
+  --> src/handle.rs
+   |
+   |     pub fn new(value: C::Complete) -> Self
+   |            --- required by a bound in this associated function
+   |     where
+   |         C: Concrete,
+   |            ^^^^^^^^ required by this bound in `Obj::<C>::new`

@@ -58,6 +58,11 @@ pub unsafe trait Class: 'static {
 ///
 /// The returned pointers must refer to the same object that was passed in, coerced to this
 /// class's `Dyn` interface.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is an abstract class, so it cannot be instantiated",
+    label = "abstract class",
+    note = "`{Self}` has at least one pure virtual method; instantiate a concrete subclass instead"
+)]
 pub unsafe trait Concrete: Class {
     /// Coerces an owned complete object to this class's interface.
     fn into_dyn(value: Box<Self::Complete>) -> Box<Self::Dyn>;

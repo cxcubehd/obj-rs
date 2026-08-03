@@ -9,5 +9,6 @@ pub use core::any::TypeId;
 pub use core::mem::offset_of;
 pub use core::ops::{Deref, DerefMut};
 
+pub use crate::cast::{subobject, subobject_mut};
 pub use crate::class::{AnyObj, Class, Concrete, SubclassOf};
-pub use crate::meta::{BaseEntry, ClassMeta, VTablePtr};
+pub use crate::meta::{BaseEntry, BaseTable, ClassMeta, VTablePtr};

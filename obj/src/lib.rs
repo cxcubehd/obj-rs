@@ -47,7 +47,7 @@
 
 extern crate alloc;
 
-mod cast;
+pub mod cast;
 pub mod class;
 mod handle;
 pub mod meta;
@@ -57,7 +57,10 @@ pub mod __private;
 
 pub use class::{AnyObj, Class, Concrete, SubclassOf};
 pub use handle::{Obj, Ref, RefMut};
-pub use meta::{BaseEntry, ClassId, ClassMeta, VTablePtr};
+pub use meta::{BaseEntry, BaseTable, ClassId, ClassMeta, VTablePtr, MAX_BASES};
+#[doc(hidden)]
+pub use obj_macros::__obj_emit;
+pub use obj_macros::{class, methods};
 
 /// Captures the vtable produced by coercing a concrete type to a `dyn` interface.
 ///

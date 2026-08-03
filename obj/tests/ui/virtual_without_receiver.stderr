@@ -1,0 +1,21 @@
+error: obj: a virtual method needs a `self` receiver
+  --> tests/ui/virtual_without_receiver.rs:10:5
+   |
+10 |     fn make() -> f64 {
+   |     ^^
+
+error[E0405]: cannot find trait `ShapeDyn` in this scope
+ --> tests/ui/virtual_without_receiver.rs:3:12
+  |
+3 | pub struct Shape {
+  |            ^^^^^ not found in this scope
+
+error[E0405]: cannot find trait `ShapeDyn` in this scope
+ --> tests/ui/virtual_without_receiver.rs:3:12
+  |
+2 | #[obj::class]
+  | ------------- in this attribute macro expansion
+3 | pub struct Shape {
+  |            ^^^^^ not found in this scope
+  |
+  = note: this error originates in the macro `__obj_ancestors_Shape` which comes from the expansion of the attribute macro `obj::class` (in Nightly builds, run with -Z macro-backtrace for more info)
