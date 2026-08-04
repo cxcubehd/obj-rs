@@ -18,3 +18,4 @@ pub use crate::cast::{subobject, subobject_mut};
 pub use crate::class::{AnyObj, Class, Concrete, SubclassOf};
 pub use crate::dyn_traits::{CloneObj, DynEq, DynHash, DynTotalEq};
 pub use crate::meta::{BaseEntry, BaseTable, ClassMeta, VTablePtr};
+pub use crate::vbase::VBase;

@@ -86,6 +86,8 @@ unsafe impl Class for Shape {
             data_offset: 0,
             dyn_vtable: None,
         }],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(
@@ -167,6 +169,8 @@ unsafe impl Class for Drawable {
             data_offset: 0,
             dyn_vtable: None,
         }],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(
@@ -320,6 +324,8 @@ unsafe impl Class for Circle {
                 dyn_vtable: Some(obj::__vtable_of!(Circle as dyn DrawableDyn)),
             },
         ],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(
@@ -519,6 +525,8 @@ unsafe impl Class for Square {
                 dyn_vtable: Some(obj::__vtable_of!(Square as dyn ShapeDyn)),
             },
         ],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(

@@ -113,6 +113,9 @@ pub(crate) fn is_a<T: Class, S: AnyObj + ?Sized>(src: &S) -> bool {
 /// If `src` does not derive from `T`. Generated code only ever calls this where the interface
 /// itself proves the relationship, so this cannot fire from safe user code.
 pub fn subobject<T: Class, S: AnyObj + ?Sized>(src: &S) -> &T {
+    if src.class_meta().shares_bases {
+        expose_complete(src.obj_addr());
+    }
     let ptr = data_ptr_of::<T, S>(src).unwrap_or_else(|| {
         panic!(
             "obj: `{}` does not derive from `{}`",
@@ -125,12 +128,33 @@ pub fn subobject<T: Class, S: AnyObj + ?Sized>(src: &S) -> &T {
     unsafe { &*ptr }
 }
 
+/// Publishes the complete object's provenance before a reference to one of its subobjects is
+/// handed out.
+///
+/// A `&Subobject` carries permission for that subobject alone. That is exactly right for field
+/// access, but a **virtual base** is a *sibling* — it lives elsewhere in the complete object — so
+/// resolving one from a subobject reference would step outside what the borrow grants. Exposing
+/// the enclosing object here is what leaves a suitable tag reachable for
+/// [`VBase::resolve`](crate::VBase::resolve) to find afterwards.
+///
+/// This costs nothing at runtime; it only tells the compiler this allocation may be reached by
+/// address, and it is why `obj` cannot be checked under `-Zmiri-strict-provenance`.
+#[inline]
+fn expose_complete(addr: *const u8) {
+    let _ = addr.expose_provenance();
+}
+
 /// Mutably borrows the `T` subobject of an object known to derive from `T`.
 ///
 /// # Panics
 ///
 /// See [`subobject`].
 pub fn subobject_mut<T: Class, S: AnyObj + ?Sized>(src: &mut S) -> &mut T {
+    // Exposed from the *unique* borrow, so that resolving a virtual base through the returned
+    // reference may also write to it. See `expose_complete`.
+    if src.class_meta().shares_bases {
+        let _ = core::ptr::from_mut(src).cast::<u8>().expose_provenance();
+    }
     let ptr = data_ptr_of::<T, S>(src).unwrap_or_else(|| {
         panic!(
             "obj: `{}` does not derive from `{}`",

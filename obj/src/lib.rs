@@ -18,6 +18,7 @@
 //! | `dynamic_cast` | [`ClassMeta`] base table, reached by one virtual call | ~a call |
 //! | Abstract class | [`Concrete`] simply not implemented | compile-time |
 //! | Virtual destructor | `Box<dyn _>` drop glue | free |
+//! | Virtual base class | [`VBase`] link into the complete object | a byte offset |
 //!
 //! Objects carry **no per-object overhead**: the vtable rides in the handle, exactly as it does
 //! for `&dyn Trait`.
@@ -37,10 +38,18 @@
 //!
 //! # Safety
 //!
-//! Generated code is safe; the `unsafe` lives in this crate and has three sources, all documented
-//! at their definitions: prefix-layout subobject addressing (guarded by `#[repr(C)]` and generated
-//! `offset_of!` assertions), fat-pointer reconstruction for sidecasts, and virtual-base offset
-//! arithmetic.
+//! The `unsafe` lives in this crate and has three sources, all documented at their definitions:
+//! prefix-layout subobject addressing (guarded by `#[repr(C)]` and generated `offset_of!`
+//! assertions), fat-pointer reconstruction for sidecasts, and virtual-base offset arithmetic.
+//!
+//! Generated code contains exactly one `unsafe` block, in the `complete(..)` constructor of a
+//! class with virtual bases, where two `offset_of!` constants are subtracted to form a
+//! [`VBase`] link.
+//!
+//! All of it is covered by Miri. Hierarchies without virtual bases are checked under
+//! `-Zmiri-strict-provenance`; virtual bases cannot be, because reaching a shared base means
+//! addressing a *sibling* of the subobject you hold and a reference grants permission for its own
+//! subobject only. Those are checked under Tree Borrows instead — see [`VBase::resolve`].
 
 #![no_std]
 #![cfg_attr(feature = "nightly", feature(ptr_metadata))]
@@ -52,6 +61,7 @@ pub mod class;
 pub mod dyn_traits;
 mod handle;
 pub mod meta;
+pub mod vbase;
 
 #[doc(hidden)]
 pub mod __private;
@@ -63,6 +73,7 @@ pub use meta::{BaseEntry, BaseTable, ClassId, ClassMeta, VTablePtr, MAX_BASES};
 #[doc(hidden)]
 pub use obj_macros::__obj_emit;
 pub use obj_macros::{class, methods};
+pub use vbase::VBase;
 
 /// Captures the vtable produced by coercing a concrete type to a `dyn` interface.
 ///

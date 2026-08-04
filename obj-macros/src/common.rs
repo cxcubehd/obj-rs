@@ -4,8 +4,43 @@
 //! That is what lets a class refer to its base's generated items while knowing nothing but the
 //! base's *name*.
 
-use proc_macro2::Span;
-use syn::Ident;
+use proc_macro2::{Span, TokenStream};
+use quote::{quote, ToTokens};
+use syn::parse::{Parse, ParseStream};
+use syn::{Ident, Token};
+
+/// A base class as written in `extends(..)`: either `Base` or `virtual Base`.
+///
+/// A virtual base is shared: however many paths reach it, the complete object holds one copy, and
+/// each subobject that names it stores a [`VBase`](../obj/vbase/struct.VBase.html) link instead of
+/// the base itself.
+#[derive(Clone)]
+pub struct BaseRef {
+    pub class: Ident,
+    pub is_virtual: bool,
+}
+
+impl Parse for BaseRef {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let is_virtual = input.peek(Token![virtual]);
+        if is_virtual {
+            input.parse::<Token![virtual]>()?;
+        }
+        Ok(BaseRef {
+            class: input.parse()?,
+            is_virtual,
+        })
+    }
+}
+
+impl ToTokens for BaseRef {
+    fn to_tokens(&self, out: &mut TokenStream) {
+        if self.is_virtual {
+            out.extend(quote!(virtual));
+        }
+        self.class.to_tokens(out);
+    }
+}
 
 /// `X` -> `XDyn`, the class's `dyn`-safe interface carrying its virtual methods.
 pub fn iface_trait(class: &Ident) -> Ident {
@@ -58,6 +93,47 @@ pub fn table_static(class: &Ident) -> Ident {
 /// `X` -> `__OBJ_META_X`, the class's runtime metadata.
 pub fn meta_static(class: &Ident) -> Ident {
     Ident::new(&format!("__OBJ_META_{class}"), Span::call_site())
+}
+
+/// `X` -> `XComplete`, the type that owns a complete object of a class with virtual bases.
+///
+/// The shared bases cannot live inside `X` itself — the most-derived class decides where the one
+/// copy goes — so they are stored alongside it here. [`Class::Complete`] names this type, and it
+/// is what actually implements the class's interface.
+///
+/// [`Class::Complete`]: ../obj/class/trait.Class.html#associatedtype.Complete
+pub fn complete_type(class: &Ident) -> Ident {
+    Ident::new(&format!("{class}Complete"), class.span())
+}
+
+/// `X` -> `__OBJ_SUB_TABLE_X`, the base table describing a bare `X` subobject.
+pub fn sub_table_static(class: &Ident) -> Ident {
+    Ident::new(&format!("__OBJ_SUB_TABLE_{class}"), Span::call_site())
+}
+
+/// `X` -> `__OBJ_SUB_META_X`, the metadata of a bare `X` subobject.
+///
+/// A class with virtual bases needs two descriptions of itself. The complete object knows where
+/// the shared bases are; a bare `X` subobject does not, because it is not the thing that stores
+/// them — so its table lists only what really lies inside it, and carries no vtables.
+pub fn sub_meta_static(class: &Ident) -> Ident {
+    Ident::new(&format!("__OBJ_SUB_META_{class}"), Span::call_site())
+}
+
+/// `X` -> `as_x`, the accessor for a secondary or virtual base subobject.
+pub fn base_accessor(base: &Ident) -> Ident {
+    Ident::new(
+        &format!("as_{}", to_snake_case(&base.to_string())),
+        base.span(),
+    )
+}
+
+/// `X` -> `as_x_mut`.
+pub fn base_accessor_mut(base: &Ident) -> Ident {
+    Ident::new(
+        &format!("as_{}_mut", to_snake_case(&base.to_string())),
+        base.span(),
+    )
 }
 
 /// The field holding the base subobject, named after the base class in snake_case.

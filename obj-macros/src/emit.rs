@@ -21,8 +21,20 @@ pub struct Ancestor {
     pub class: Ident,
     pub is_abstract: bool,
     pub vis: Visibility,
-    pub direct_bases: Vec<Ident>,
+    pub direct_bases: Vec<BaseRef>,
     pub dyn_traits: Vec<Ident>,
+}
+
+impl Ancestor {
+    /// The bases stored inside this class's own layout.
+    fn stored_bases(&self) -> impl Iterator<Item = &BaseRef> {
+        self.direct_bases.iter().filter(|b| !b.is_virtual)
+    }
+
+    /// The bases this class shares with the rest of the complete object.
+    fn virtual_bases(&self) -> impl Iterator<Item = &BaseRef> {
+        self.direct_bases.iter().filter(|b| b.is_virtual)
+    }
 }
 
 impl Parse for Ancestor {
@@ -143,9 +155,257 @@ fn inherited_dyn_traits(ancestors: &[&Ancestor]) -> Vec<Ident> {
     out
 }
 
+/// Where every subobject of a complete object lives.
+///
+/// Without virtual bases this is trivial: the class *is* the complete object, and every ancestor
+/// is a field chain away. With them the shared bases cannot sit inside any one subobject — two
+/// paths reach them and there must still be one copy — so the macro generates a wrapper holding
+/// the class plus one copy of each shared base, and every offset is measured from that wrapper.
+struct Layout {
+    /// The type that owns a complete object: the class, or its generated wrapper.
+    complete: Ident,
+    /// Whether a wrapper was needed.
+    wrapped: bool,
+    /// The shared bases the wrapper stores, deduplicated, in a stable order.
+    vbases: Vec<Ident>,
+    /// Field path from `complete` down to each ancestor's subobject.
+    paths: Vec<(Ident, TokenStream)>,
+}
+
+impl Layout {
+    fn of(class: &Ident, is_abstract: bool, ancestors: &[&Ancestor]) -> syn::Result<Self> {
+        let mut vbases: Vec<Ident> = Vec::new();
+        for a in ancestors {
+            for v in a.virtual_bases() {
+                if !vbases.contains(&v.class) {
+                    vbases.push(v.class.clone());
+                }
+            }
+        }
+
+        // Inheriting one class both ways would mean two copies under one name, and every lookup
+        // would have to say which it meant. C++ permits it; refusing is clearer and costs nothing
+        // anyone actually wants.
+        for a in ancestors {
+            for b in a.stored_bases() {
+                if vbases.contains(&b.class) {
+                    return Err(syn::Error::new(
+                        b.class.span(),
+                        format!(
+                            "obj: `{}` is inherited both virtually and directly within `{class}`'s \
+                             hierarchy; make every path to it `virtual`, or none of them",
+                            b.class,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // An abstract class is never a complete object, so it stores no shared base and needs no
+        // wrapper. Each concrete class below it holds the one copy instead.
+        let wrapped = !vbases.is_empty() && !is_abstract;
+        if !wrapped {
+            vbases.clear();
+        }
+        let complete = if wrapped {
+            complete_type(class)
+        } else {
+            class.clone()
+        };
+
+        // Roots: the class's own subobject, and one slot per shared base.
+        let mut paths: Vec<(Ident, TokenStream)> = Vec::new();
+        if wrapped {
+            let f = base_field(class);
+            paths.push((class.clone(), quote!(#f)));
+            for v in &vbases {
+                let f = base_field(v);
+                paths.push((v.clone(), quote!(#f)));
+            }
+        } else {
+            paths.push((class.clone(), TokenStream::new()));
+        }
+
+        // The ancestor list runs derived-before-base, so a single forward pass suffices: by the
+        // time a class is visited, whichever branch reached it first has already given it a path.
+        for a in ancestors {
+            let Some(prefix) = paths
+                .iter()
+                .find(|(c, _)| *c == a.class)
+                .map(|(_, p)| p.clone())
+            else {
+                continue;
+            };
+            for b in a.stored_bases() {
+                if paths.iter().any(|(c, _)| *c == b.class) {
+                    continue;
+                }
+                let f = base_field(&b.class);
+                let path = if prefix.is_empty() {
+                    quote!(#f)
+                } else {
+                    quote!(#prefix.#f)
+                };
+                paths.push((b.class.clone(), path));
+            }
+        }
+
+        Ok(Layout {
+            complete,
+            wrapped,
+            vbases,
+            paths,
+        })
+    }
+
+    /// The field path from the complete object to `class`'s subobject.
+    fn path(&self, class: &Ident) -> Option<&TokenStream> {
+        self.paths.iter().find(|(c, _)| c == class).map(|(_, p)| p)
+    }
+
+    /// The wrapper type, its constructor, and the trait impls it needs.
+    ///
+    /// The constructor is the only place virtual-base links are written: it places each shared
+    /// base once, then walks every subobject that names one and records the distance to it.
+    fn expand_complete(
+        &self,
+        class: &Ident,
+        vis: &Visibility,
+        ancestors: &[&Ancestor],
+    ) -> syn::Result<TokenStream> {
+        if !self.wrapped {
+            return Ok(TokenStream::new());
+        }
+        let complete = &self.complete;
+        let sub_field = base_field(class);
+        let vfields: Vec<Ident> = self.vbases.iter().map(base_field).collect();
+        let vbases = &self.vbases;
+
+        let requested = inherited_dyn_traits(ancestors);
+        let derives: Vec<TokenStream> = requested
+            .iter()
+            .filter_map(|t| match t.to_string().as_str() {
+                "Debug" => Some(quote!(::core::fmt::Debug)),
+                "PartialEq" => Some(quote!(::core::cmp::PartialEq)),
+                "Eq" => Some(quote!(::core::cmp::Eq)),
+                "Hash" => Some(quote!(::core::hash::Hash)),
+                // `Clone` is written out below rather than derived -- see there.
+                _ => None,
+            })
+            .collect();
+        // Deriving on the wrapper is what makes the shared base take part exactly once: it is a
+        // field here and nowhere else, so it is compared and hashed with the object rather than
+        // once per path that reaches it.
+        let derive_attr = (!derives.is_empty()).then(|| quote!(#[derive(#(#derives),*)]));
+
+        // Cloning cannot be derived. Every virtual-base link is an offset that only means anything
+        // inside the complete object it was built for, and cloning the class subobject clears its
+        // links precisely so a stray copy cannot resolve one. Rebuilding through the constructor
+        // is what makes the copy whole again.
+        let clone = requested.iter().any(|t| t == "Clone").then(|| {
+            let vf = &vfields;
+            quote! {
+                impl ::core::clone::Clone for #complete {
+                    #[inline]
+                    fn clone(&self) -> Self {
+                        #class::complete(
+                            ::core::clone::Clone::clone(&self.#sub_field),
+                            #(::core::clone::Clone::clone(&self.#vf),)*
+                        )
+                    }
+                }
+            }
+        });
+
+        let display = requested.iter().any(|t| t == "Display").then(|| {
+            quote! {
+                impl ::core::fmt::Display for #complete {
+                    #[inline]
+                    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                        ::core::fmt::Display::fmt(&self.#sub_field, f)
+                    }
+                }
+            }
+        });
+
+        let mut fixups = Vec::new();
+        for a in ancestors {
+            let Some(owner) = self.path(&a.class) else {
+                continue;
+            };
+            for v in a.virtual_bases() {
+                let Some(shared) = self.path(&v.class) else {
+                    continue;
+                };
+                let slot = base_field(&v.class);
+                fixups.push(quote! {
+                    // SAFETY: both operands are `offset_of!` constants of the same `#[repr(C)]`
+                    // complete type, so their difference is exactly the distance from this
+                    // subobject to the single shared base -- which is what `link` requires.
+                    obj.#owner.#slot = unsafe {
+                        ::obj::__private::VBase::link(
+                            ::obj::__private::offset_of!(#complete, #shared) as isize
+                                - ::obj::__private::offset_of!(#complete, #owner) as isize,
+                        )
+                    };
+                });
+            }
+        }
+
+        let shared_list = vbases
+            .iter()
+            .map(|v| format!("`{v}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let struct_doc = format!(
+            "A complete `{class}` object, including the shared base subobjects.\n\nBecause \
+             `{class}` inherits {shared_list} virtually, the shared copy cannot live inside \
+             `{class}` itself — every path through the hierarchy has to reach the *same* one. It \
+             lives here instead, which is why [`Obj::<{class}>::new`](obj::Obj::new) takes this \
+             type rather than `{class}`.\n\nBuild one with [`{class}::complete`].",
+        );
+        let ctor_doc = format!(
+            "Assembles a complete `{class}`, placing {shared_list} once and linking every \
+             subobject that shares it.\n\nThis is the `obj` equivalent of a C++ most-derived \
+             constructor, which is likewise the only one that initialises virtual bases.\n\n\
+             ```ignore\nlet obj = Obj::<{class}>::new({class}::complete(sub, shared));\n```",
+        );
+
+        Ok(quote! {
+            #[doc = #struct_doc]
+            #[repr(C)]
+            #derive_attr
+            #vis struct #complete {
+                #sub_field: #class,
+                #(#vfields: #vbases,)*
+            }
+
+            // The class subobject leads, so the complete object and the class share an address
+            // and every table entry measured from the wrapper is also correct from the class.
+            const _: () = assert!(
+                ::obj::__private::offset_of!(#complete, #sub_field) == 0,
+                "obj: the class subobject must lead its complete object",
+            );
+
+            impl #class {
+                #[doc = #ctor_doc]
+                #[must_use]
+                #vis fn complete(#sub_field: #class, #(#vfields: #vbases),*) -> #complete {
+                    let mut obj = #complete { #sub_field, #(#vfields),* };
+                    #(#fixups)*
+                    obj
+                }
+            }
+
+            #clone
+            #display
+        })
+    }
+}
+
 pub enum Kind {
     Class {
-        bases: Vec<Ident>,
+        bases: Vec<BaseRef>,
     },
     Methods {
         virtual_sigs: TokenStream,
@@ -153,12 +413,24 @@ pub enum Kind {
     },
 }
 
+/// Where the delegate subobject lives inside the target.
+pub enum Route {
+    /// The target implements its own interface, so the receiver is `self`.
+    Own,
+    /// A base stored inline, reached by field access.
+    Field(Ident),
+    /// A shared base, reached by resolving this class's `VBase` link.
+    Virtual,
+}
+
 /// How a class reaches the implementation of a method it does not provide itself.
 pub struct Delegate {
     /// The base to hand the call to.
     pub class: Ident,
-    /// The field holding that base, or `None` when the class implements its own interface.
-    pub field: Option<Ident>,
+    /// How to get from the target to that base's subobject.
+    pub route: Route,
+    /// Whether that base is abstract, and so implements no interface to name.
+    pub is_abstract: bool,
 }
 
 impl Parse for Delegate {
@@ -166,13 +438,26 @@ impl Parse for Delegate {
         let content;
         syn::parenthesized!(content in input);
         let class = content.parse()?;
-        let field = if content.peek(Token![self]) {
+        if content.peek(Token![self]) {
             content.parse::<Token![self]>()?;
-            None
+            return Ok(Delegate {
+                class,
+                route: Route::Own,
+                is_abstract: false,
+            });
+        }
+        let route = if content.peek(Token![virtual]) {
+            content.parse::<Token![virtual]>()?;
+            Route::Virtual
         } else {
-            Some(content.parse()?)
+            Route::Field(content.parse()?)
         };
-        Ok(Delegate { class, field })
+        let is_abstract = content.parse::<LitBool>()?.value;
+        Ok(Delegate {
+            class,
+            route,
+            is_abstract,
+        })
     }
 }
 
@@ -387,25 +672,44 @@ fn expand_iface(input: &IfaceInput) -> syn::Result<TokenStream> {
             // The target implements this itself.
             quote!(#target::#name(self #(, #args)*))
         } else {
-            match &delegate.field {
+            match &delegate.route {
                 // Implementing its own interface: the inherent method must exist, and its
                 // absence is exactly the "pure virtual never overridden" error.
-                None => quote!(#target::#name(self #(, #args)*)),
-                Some(field) => {
-                    let mutability = sig
-                        .receiver()
-                        .and_then(|r| r.mutability)
-                        .map(|_| quote!(mut));
+                Route::Own => quote!(#target::#name(self #(, #args)*)),
+                route => {
+                    let is_mut = sig.receiver().and_then(|r| r.mutability).is_some();
+                    let mutability = is_mut.then(|| quote!(mut));
                     let base = &delegate.class;
+                    // How to name the delegate's subobject. A shared base is not a field of this
+                    // class, only a link, so it is reached through the generated accessor.
+                    let recv = match route {
+                        Route::Field(field) => quote!(& #mutability self.#field),
+                        Route::Virtual => {
+                            let acc = if is_mut {
+                                base_accessor_mut(base)
+                            } else {
+                                base_accessor(base)
+                            };
+                            quote!(self.#acc())
+                        }
+                        Route::Own => unreachable!("handled above"),
+                    };
                     if base == owner {
                         // The provider is the interface's own class: call its inherent body.
-                        quote!(#owner::#name(& #mutability self.#field #(, #args)*))
+                        quote!(#owner::#name(#recv #(, #args)*))
+                    } else if delegate.is_abstract {
+                        // An *abstract* intermediate implements no interface, so there is no
+                        // `<Base as OwnerDyn>` to name. Method-call syntax resolves it instead:
+                        // starting at the base subobject it finds that base's own inherent
+                        // override first, then its interface impl if it has one, and otherwise
+                        // derefs on up the chain to whichever ancestor supplied the body. It can
+                        // never pick this impl back up, because the receiver is a strictly
+                        // shallower subobject than `self`.
+                        quote!((#recv).#name(#(#args),*))
                     } else {
-                        // An intermediate base: go through its interface impl, which resolves
-                        // the same question one level up.
-                        quote!(
-                            <#base as #owner_iface>::#name(& #mutability self.#field #(, #args)*)
-                        )
+                        // A concrete intermediate: name its interface impl exactly, which
+                        // resolves the same question one level up.
+                        quote!(<#base as #owner_iface>::#name(#recv #(, #args)*))
                     }
                 }
             }
@@ -423,7 +727,7 @@ fn expand_iface(input: &IfaceInput) -> syn::Result<TokenStream> {
     })
 }
 
-fn self_entry(class: &Ident, is_abstract: bool) -> TokenStream {
+fn self_entry(class: &Ident, complete: &Ident, is_abstract: bool) -> TokenStream {
     let iface = iface_trait(class);
     let vtable = if is_abstract {
         // An abstract class implements no interface, not even its own, so there is no vtable to
@@ -431,8 +735,10 @@ fn self_entry(class: &Ident, is_abstract: bool) -> TokenStream {
         // most-derived class of a live object.
         quote!(::core::option::Option::None)
     } else {
+        // The vtable belongs to the *complete* object, which is the type that implements the
+        // interface and the type a live handle actually points at.
         quote!(::core::option::Option::Some(
-            ::obj::__vtable_of!(#class as dyn #iface)
+            ::obj::__vtable_of!(#complete as dyn #iface)
         ))
     };
     quote! {
@@ -446,7 +752,7 @@ fn self_entry(class: &Ident, is_abstract: bool) -> TokenStream {
 
 fn expand_class(
     class: &Ident,
-    bases: &[Ident],
+    bases: &[BaseRef],
     ancestors: &[&Ancestor],
 ) -> syn::Result<TokenStream> {
     let me = ancestors
@@ -454,6 +760,8 @@ fn expand_class(
         .ok_or_else(|| syn::Error::new(class.span(), "obj: empty ancestor list"))?;
     let vis = &me.vis;
     let is_abstract = me.is_abstract;
+    let layout = Layout::of(class, is_abstract, ancestors)?;
+    let complete = &layout.complete;
 
     let iface = iface_trait(class);
     let sub_tr = sub_trait(class);
@@ -463,43 +771,73 @@ fn expand_class(
     let sub_fn = sub_fn(class);
     let sub_fn_mut = sub_fn_mut(class);
     let name_lit = LitStr::new(&class.to_string(), class.span());
-    let entry = self_entry(class, is_abstract);
+    let entry = self_entry(class, complete, is_abstract);
+    let shares_bases = layout.wrapped;
 
-    // One sub-table per base, each shifted by where that base sits inside this class. Concrete
-    // classes go through the base's `__ObjBases*` trait, which rewrites every inherited entry to
-    // carry *this* class's vtables.
-    let branch = |b: &Ident| {
-        let f = base_field(b);
-        let b_bases = bases_trait(b);
-        if is_abstract {
-            quote! {
-                ::obj::BaseTable::from_slice_without_vtables(<#b as ::obj::Class>::META.bases)
-                    .offset_by(::obj::__private::offset_of!(#class, #f))
-            }
-        } else {
-            quote! {
-                <#class as #b_bases>::OBJ_TABLE
-                    .offset_by(::obj::__private::offset_of!(#class, #f))
-            }
-        }
+    // Where each subobject sits inside the complete object. Without virtual bases this is just
+    // the field chain from the class; with them, everything is measured from the wrapper instead,
+    // because that is the type a live object actually has.
+    let offset_of = |c: &Ident| -> syn::Result<TokenStream> {
+        let path = layout.path(c).ok_or_else(|| {
+            syn::Error::new(
+                class.span(),
+                format!("obj: no path from `{class}` to its `{c}` subobject"),
+            )
+        })?;
+        Ok(quote!(::obj::__private::offset_of!(#complete, #path)))
     };
 
-    let table_expr = match bases.split_first() {
+    // One sub-table per base, each shifted by where that base sits. Concrete classes go through
+    // the base's `__ObjBases*` trait, which rewrites every inherited entry to carry *this* class's
+    // vtables.
+    let branch = |b: &Ident| -> syn::Result<TokenStream> {
+        let at = offset_of(b)?;
+        let b_bases = bases_trait(b);
+        Ok(if is_abstract {
+            quote! {
+                ::obj::BaseTable::from_slice_without_vtables(<#b as ::obj::Class>::META.bases)
+                    .offset_by(#at)
+            }
+        } else {
+            quote!(<#complete as #b_bases>::OBJ_TABLE.offset_by(#at))
+        })
+    };
+
+    // Entries for what lies inside the class's own layout: its non-virtual bases, then itself.
+    let stored: Vec<&Ident> = bases
+        .iter()
+        .filter(|b| !b.is_virtual)
+        .map(|b| &b.class)
+        .collect();
+    let inline_table = match stored.split_first() {
         Some((primary, secondaries)) => {
-            let head = branch(primary);
-            let rest = secondaries.iter().map(|b| {
-                let t = branch(b);
-                quote!(.concat(#t))
-            });
-            quote!(#head #(#rest)* .push(#entry))
+            let head = branch(primary)?;
+            let mut expr = quote!(#head);
+            for b in secondaries {
+                let t = branch(b)?;
+                expr = quote!(#expr.concat(#t));
+            }
+            quote!(#expr.push(#entry))
         }
         None => quote!(::obj::BaseTable::EMPTY.push(#entry)),
     };
 
+    // Virtual bases are appended by whoever *stores* them -- never carried up through the
+    // `__ObjBases` chain, because their offset is not fixed relative to any intermediate class.
+    // That is also what deduplicates a diamond: however many paths reach the shared base, only
+    // the complete object contributes its entry, once.
+    let mut table_expr = inline_table.clone();
+    for v in &layout.vbases {
+        let at = offset_of(v)?;
+        let v_bases = bases_trait(v);
+        table_expr = quote!(#table_expr.concat(<#complete as #v_bases>::OBJ_TABLE.offset_by(#at)));
+    }
+
     // The same construction for an arbitrary subclass `C`, so descendants inherit entries for
-    // ancestors they were never told about.
+    // ancestors they were never told about. Offsets here are relative to *this* class, since the
+    // caller shifts the whole table by wherever it put this subobject.
     let bases_impl = {
-        let extra_bounds = bases.iter().map(|b| {
+        let extra_bounds = stored.iter().map(|b| {
             let t = bases_trait(b);
             quote!(+ #t)
         });
@@ -510,7 +848,7 @@ fn expand_class(
                 dyn_vtable: ::core::option::Option::Some(::obj::__vtable_of!(C as dyn #iface)),
             }
         };
-        let expr = match bases.split_first() {
+        let expr = match stored.split_first() {
             Some((primary, secondaries)) => {
                 let mk = |b: &Ident| {
                     let f = base_field(b);
@@ -529,15 +867,47 @@ fn expand_class(
             }
             None => quote!(::obj::BaseTable::EMPTY.push(#sub_entry)),
         };
+        // `C` is whatever type implements the interface -- the class itself, or a subclass's
+        // `Complete` wrapper, which is not a `Class`. So the bound is the interface, not `Class`.
         quote! {
             impl<C> #bases_tr for C
             where
-                C: ::obj::Class + #iface + Sized + ::obj::SubclassOf<#class> #(#extra_bounds)*,
+                C: #iface + Sized #(#extra_bounds)*,
             {
                 const OBJ_TABLE: ::obj::BaseTable = #expr;
             }
         }
     };
+
+    // A class with virtual bases needs a second, smaller description of itself, for a *bare*
+    // subobject that is not part of a complete object. Such a subobject genuinely cannot say
+    // where the shared bases are, so its table omits them -- and carries no vtables either, since
+    // it can never be a live object. Without this, resolving a shared base from a bare subobject
+    // would read past the end of it.
+    let sub_table = sub_table_static(class);
+    let sub_meta = sub_meta_static(class);
+    let (self_meta, sub_meta_def) = if layout.wrapped {
+        (
+            quote!(#sub_meta),
+            quote! {
+                #[doc(hidden)]
+                #vis static #sub_table: ::obj::BaseTable = #inline_table.without_vtables();
+
+                #[doc(hidden)]
+                // A bare subobject stores no shared base, so nothing may be resolved from it.
+                #vis static #sub_meta: ::obj::ClassMeta = ::obj::ClassMeta {
+                    name: #name_lit,
+                    id: ::obj::__private::TypeId::of::<#class>,
+                    bases: #sub_table.as_slice(),
+                    shares_bases: false,
+                };
+            },
+        )
+    } else {
+        (quote!(#meta), quote!())
+    };
+
+    let complete_def = layout.expand_complete(class, vis, ancestors)?;
 
     // Upcasts to every ancestor, each one a plain trait-upcasting coercion.
     let upcasts = ancestors.iter().map(|a| {
@@ -572,14 +942,27 @@ fn expand_class(
     // The shim impls behind `dyn_traits(..)`. Abstract classes implement no interface, so nothing
     // requires these of them -- and demanding `Clone` or `PartialEq` of a class that can never be
     // instantiated would be a pointless bound on the user.
-    let self_ty = quote!(#class);
+    // These are required of every type that implements the interface. That is the complete object,
+    // and — when the two differ — the class itself as well, since the class type is what a
+    // subclass delegates to.
     let dyn_trait_impls: Vec<TokenStream> = if is_abstract {
         Vec::new()
     } else {
-        inherited_dyn_traits(ancestors)
+        let requested = inherited_dyn_traits(ancestors);
+        let complete_ty = quote!(#complete);
+        let mut out: Vec<TokenStream> = requested
             .iter()
-            .filter_map(|t| dyn_trait_impl(t, &self_ty))
-            .collect()
+            .filter_map(|t| dyn_trait_impl(t, &complete_ty))
+            .collect();
+        if layout.wrapped {
+            let class_ty = quote!(#class);
+            out.extend(
+                requested
+                    .iter()
+                    .filter_map(|t| dyn_trait_impl(t, &class_ty)),
+            );
+        }
+        out
     };
 
     let concrete = (!is_abstract).then(|| {
@@ -587,23 +970,36 @@ fn expand_class(
             unsafe impl ::obj::Concrete for #class {
                 #[inline]
                 fn into_dyn(
-                    value: ::obj::__private::Box<#class>,
+                    value: ::obj::__private::Box<#complete>,
                 ) -> ::obj::__private::Box<dyn #iface> { value }
                 #[inline]
-                fn as_dyn(value: &#class) -> &(dyn #iface + 'static) { value }
+                fn as_dyn(value: &#complete) -> &(dyn #iface + 'static) { value }
                 #[inline]
-                fn as_dyn_mut(value: &mut #class) -> &mut (dyn #iface + 'static) { value }
+                fn as_dyn_mut(value: &mut #complete) -> &mut (dyn #iface + 'static) { value }
                 #[inline]
                 fn rc_into_dyn(
-                    value: ::obj::__private::Rc<#class>,
+                    value: ::obj::__private::Rc<#complete>,
                 ) -> ::obj::__private::Rc<dyn #iface> { value }
                 #[inline]
                 fn arc_into_dyn(
-                    value: ::obj::__private::Arc<#class>,
+                    value: ::obj::__private::Arc<#complete>,
                 ) -> ::obj::__private::Arc<dyn #iface + Send + Sync>
                 where
-                    #class: Send + Sync,
+                    #complete: Send + Sync,
                 { value }
+            }
+        }
+    });
+
+    // The wrapper is the live object, so it is what answers "what class am I, and where does the
+    // complete object start". The bare class keeps its own, vtable-free answer.
+    let complete_any_obj = layout.wrapped.then(|| {
+        quote! {
+            unsafe impl ::obj::AnyObj for #complete {
+                #[inline]
+                fn class_meta(&self) -> &'static ::obj::ClassMeta { &#meta }
+                #[inline]
+                fn obj_addr(&self) -> *const u8 { (self as *const Self).cast::<u8>() }
             }
         }
     });
@@ -654,10 +1050,13 @@ fn expand_class(
 
         unsafe impl ::obj::AnyObj for #class {
             #[inline]
-            fn class_meta(&self) -> &'static ::obj::ClassMeta { &#meta }
+            fn class_meta(&self) -> &'static ::obj::ClassMeta { &#self_meta }
             #[inline]
             fn obj_addr(&self) -> *const u8 { (self as *const Self).cast::<u8>() }
         }
+
+        #complete_def
+        #complete_any_obj
 
         #[doc(hidden)]
         #vis static #table: ::obj::BaseTable = #table_expr;
@@ -667,12 +1066,15 @@ fn expand_class(
             name: #name_lit,
             id: ::obj::__private::TypeId::of::<#class>,
             bases: #table.as_slice(),
+            shares_bases: #shares_bases,
         };
+
+        #sub_meta_def
 
         unsafe impl ::obj::Class for #class {
             type Dyn = dyn #iface;
             type SendDyn = dyn #iface + Send + Sync;
-            type Complete = #class;
+            type Complete = #complete;
             const META: &'static ::obj::ClassMeta = &#meta;
             #[inline]
             fn send_as_dyn<'a>(
@@ -682,7 +1084,7 @@ fn expand_class(
 
         #[doc(hidden)]
         #[allow(missing_docs)]
-        #vis trait #bases_tr: ::obj::Class + #iface + Sized {
+        #vis trait #bases_tr: #iface + Sized {
             const OBJ_TABLE: ::obj::BaseTable;
         }
         #bases_impl
@@ -694,14 +1096,14 @@ fn expand_class(
 }
 
 /// Walks the class graph to find whether `from` is, or derives from, `target`.
-fn reaches(graph: &[(&Ident, &Vec<Ident>)], from: &Ident, target: &Ident) -> bool {
+fn reaches(graph: &[(&Ident, &Vec<BaseRef>)], from: &Ident, target: &Ident) -> bool {
     if from == target {
         return true;
     }
     graph
         .iter()
         .find(|(name, _)| *name == from)
-        .is_some_and(|(_, bases)| bases.iter().any(|b| reaches(graph, b, target)))
+        .is_some_and(|(_, bases)| bases.iter().any(|b| reaches(graph, &b.class, target)))
 }
 
 fn expand_methods(
@@ -722,7 +1124,7 @@ fn expand_methods(
     let mut supertraits = if me.direct_bases.is_empty() {
         quote!(::obj::AnyObj)
     } else {
-        let each = me.direct_bases.iter().map(iface_trait);
+        let each = me.direct_bases.iter().map(|b| iface_trait(&b.class));
         quote!(#(#each)+*)
     };
 
@@ -735,10 +1137,14 @@ fn expand_methods(
         supertraits = quote!(#supertraits + #path);
     }
 
-    let graph: Vec<(&Ident, &Vec<Ident>)> = ancestors
+    let graph: Vec<(&Ident, &Vec<BaseRef>)> = ancestors
         .iter()
         .map(|a| (&a.class, &a.direct_bases))
         .collect();
+    let is_abstract = |c: &Ident| ancestors.iter().any(|a| a.class == *c && a.is_abstract);
+
+    let layout = Layout::of(class, me.is_abstract, ancestors)?;
+    let complete = &layout.complete;
 
     // One interface impl per ancestor. Each names the base that non-overridden methods are
     // delegated to, which is the direct base through which this class reaches that ancestor.
@@ -752,16 +1158,34 @@ fn expand_methods(
             let delegate = if owner == class {
                 quote!((#class self))
             } else {
-                let Some(via) = me.direct_bases.iter().find(|d| reaches(&graph, d, owner)) else {
+                let Some(via) = me
+                    .direct_bases
+                    .iter()
+                    .find(|d| reaches(&graph, &d.class, owner))
+                else {
                     return Err(syn::Error::new(
                         class.span(),
                         format!("obj: no base of `{class}` reaches `{owner}`"),
                     ));
                 };
-                let field = base_field(via);
-                quote!((#via #field))
+                let base = &via.class;
+                let abstract_base = is_abstract(base);
+                if via.is_virtual {
+                    quote!((#base virtual #abstract_base))
+                } else {
+                    let field = base_field(base);
+                    quote!((#base #field #abstract_base))
+                }
             };
             calls.push(quote!(#mac! { #class, #delegate, [#(#provides)*] }));
+
+            // The complete object is what a live handle points at, so it is what has to implement
+            // every interface. It owns no behaviour of its own -- it forwards each method straight
+            // to the class subobject it wraps, which resolved the dispatch already.
+            if layout.wrapped {
+                let sub_field = base_field(class);
+                calls.push(quote!(#mac! { #complete, (#class #sub_field false), [] }));
+            }
         }
         Some(quote!(#(#calls)*))
     };

@@ -21,7 +21,40 @@ mod methods;
 ///
 /// #[obj::class(abstract)]             // has pure virtual methods; cannot be instantiated
 /// pub struct Drawable { }
+///
+/// #[obj::class(extends(Html, Xml))]   // multiple inheritance
+/// pub struct Xhtml { }
 /// ```
+///
+/// # Virtual bases
+///
+/// Marking a base `virtual` makes it **shared**: however many paths through the hierarchy reach
+/// it, the complete object holds one copy. This is what deduplicates a diamond.
+///
+/// ```ignore
+/// #[obj::class(extends(virtual Doc))] pub struct Html { pub tag: String }
+/// #[obj::class(extends(virtual Doc))] pub struct Xml  { pub ns: String }
+/// #[obj::class(extends(Html, Xml))]   pub struct Xhtml { pub strict: bool }
+/// ```
+///
+/// The class then stores a `VBase` link where a subobject would otherwise sit, so
+/// write `VBase::new()` for it in a struct literal and build the object through the generated
+/// `complete(..)` constructor, which places each shared base once and links every subobject to it:
+///
+/// ```ignore
+/// let obj = Obj::<Xhtml>::new(Xhtml::complete(
+///     Xhtml {
+///         html: Html { doc: VBase::new(), tag: "p".into() },
+///         xml:  Xml  { doc: VBase::new(), ns:  "x".into() },
+///         strict: true,
+///     },
+///     Doc { id: 1 },      // the one shared base
+/// ));
+/// ```
+///
+/// Reach it with the generated `as_doc()` / `as_doc_mut()`, or through `Deref` when the virtual
+/// base is the class's only base. This mirrors C++, where the most-derived constructor is likewise
+/// the only one that initialises virtual bases.
 ///
 /// The struct is given `#[repr(C)]` and, when it has a base, the base subobject is inserted as its
 /// first field. Every class must also have an `#[obj::methods]` block, which declares its virtual

@@ -89,6 +89,14 @@ pub struct ClassMeta {
     pub id: fn() -> ClassId,
     /// This class followed by all of its ancestors, most-derived first.
     pub bases: &'static [BaseEntry],
+    /// Whether a complete object of this class stores virtual base subobjects.
+    ///
+    /// Reaching a virtual base means addressing a *sibling* of the subobject you hold, which needs
+    /// the enclosing object's provenance rather than the subobject's. That is arranged only for
+    /// hierarchies that actually use virtual inheritance, so ordinary classes pay nothing and stay
+    /// checkable under `-Zmiri-strict-provenance` — see
+    /// [`VBase::resolve`](crate::VBase::resolve).
+    pub shares_bases: bool,
 }
 
 impl ClassMeta {
@@ -214,6 +222,21 @@ impl BaseTable {
             i += 1;
         }
         out
+    }
+
+    /// Drops every vtable, keeping the offsets.
+    ///
+    /// Used for the table that describes a *bare* subobject of a class with virtual bases. Such a
+    /// subobject can answer where its non-virtual ancestors sit, but it is not a complete object,
+    /// so it must never hand out a vtable for one.
+    #[must_use]
+    pub const fn without_vtables(mut self) -> Self {
+        let mut i = 0;
+        while i < self.len {
+            self.entries[i].dyn_vtable = None;
+            i += 1;
+        }
+        self
     }
 
     /// The live entries.
