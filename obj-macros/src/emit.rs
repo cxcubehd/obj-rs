@@ -413,14 +413,37 @@ pub enum Kind {
     },
 }
 
+/// One step from a class to one of its direct bases.
+pub enum Step {
+    /// A base stored inline: a field access.
+    Field(Ident),
+    /// A shared base: the generated accessor, which resolves the `VBase` link.
+    Virtual(Ident),
+}
+
+impl Parse for Step {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let content;
+        syn::parenthesized!(content in input);
+        if content.peek(Token![virtual]) {
+            content.parse::<Token![virtual]>()?;
+            Ok(Step::Virtual(content.parse()?))
+        } else {
+            Ok(Step::Field(content.parse()?))
+        }
+    }
+}
+
 /// Where the delegate subobject lives inside the target.
 pub enum Route {
     /// The target implements its own interface, so the receiver is `self`.
     Own,
-    /// A base stored inline, reached by field access.
-    Field(Ident),
-    /// A shared base, reached by resolving this class's `VBase` link.
-    Virtual,
+    /// A chain of steps down to the delegate's subobject.
+    ///
+    /// Usually one step. It grows when the delegate is abstract and reaches the interface's owner
+    /// through a *secondary* base: method lookup only ever walks the primary chain, so the path
+    /// has to cross the branch explicitly.
+    Path(Vec<Step>),
 }
 
 /// How a class reaches the implementation of a method it does not provide itself.
@@ -446,12 +469,13 @@ impl Parse for Delegate {
                 is_abstract: false,
             });
         }
-        let route = if content.peek(Token![virtual]) {
-            content.parse::<Token![virtual]>()?;
-            Route::Virtual
-        } else {
-            Route::Field(content.parse()?)
-        };
+        let steps;
+        syn::bracketed!(steps in content);
+        let mut path = Vec::new();
+        while !steps.is_empty() {
+            path.push(steps.parse()?);
+        }
+        let route = Route::Path(path);
         let is_abstract = content.parse::<LitBool>()?.value;
         Ok(Delegate {
             class,
@@ -682,24 +706,32 @@ fn expand_iface(input: &IfaceInput) -> syn::Result<TokenStream> {
                 // Implementing its own interface: the inherent method must exist, and its
                 // absence is exactly the "pure virtual never overridden" error.
                 Route::Own => quote!(#target::#name(self #(, #args)*)),
-                route => {
+                Route::Path(path) => {
                     let is_mut = sig.receiver().and_then(|r| r.mutability).is_some();
-                    let mutability = is_mut.then(|| quote!(mut));
                     let base = &delegate.class;
-                    // How to name the delegate's subobject. A shared base is not a field of this
-                    // class, only a link, so it is reached through the generated accessor.
-                    let recv = match route {
-                        Route::Field(field) => quote!(& #mutability self.#field),
-                        Route::Virtual => {
-                            let acc = if is_mut {
-                                base_accessor_mut(base)
-                            } else {
-                                base_accessor(base)
-                            };
-                            quote!(self.#acc())
+                    // Walk down to the delegate's subobject. A shared base is not a field, only a
+                    // link, so it is reached through the generated accessor -- which already
+                    // yields a reference, and so needs no `&` in front of it.
+                    let mut recv = quote!(self);
+                    let mut is_place = true;
+                    for step in path {
+                        match step {
+                            Step::Field(field) => recv = quote!(#recv.#field),
+                            Step::Virtual(shared) => {
+                                let acc = if is_mut {
+                                    base_accessor_mut(shared)
+                                } else {
+                                    base_accessor(shared)
+                                };
+                                recv = quote!(#recv.#acc());
+                                is_place = false;
+                            }
                         }
-                        Route::Own => unreachable!("handled above"),
-                    };
+                    }
+                    if is_place {
+                        let mutability = is_mut.then(|| quote!(mut));
+                        recv = quote!(& #mutability #recv);
+                    }
                     if base == owner {
                         // The provider is the interface's own class: call its inherent body.
                         quote!(#owner::#name(#recv #(, #args)*))
@@ -1126,6 +1158,55 @@ fn expand_class(
     })
 }
 
+/// Builds the path from `class` down to the subobject that a non-overridden method is handed to,
+/// and reports whether that subobject's class implements the interface itself.
+///
+/// One step is usually enough: hand the call to the direct base, and let method lookup take it
+/// from there. Lookup only walks the *primary* chain, though, so when an abstract class reaches
+/// the interface's owner through a secondary base, the path has to cross that branch explicitly —
+/// nothing on the primary chain would ever find the method.
+///
+/// The walk stops as soon as it reaches a class that can answer for itself: a concrete one, whose
+/// interface impl resolves the rest; the owner, whose inherent method is the implementation; or
+/// one whose route to the owner runs through its own primary base, where lookup can finish the
+/// job — and finish it *better*, since it also finds overrides added along the way.
+fn delegate_path(
+    graph: &[(&Ident, &Vec<BaseRef>)],
+    abstract_classes: &[&Ident],
+    from: &BaseRef,
+    owner: &Ident,
+) -> Vec<TokenStream> {
+    let step = |b: &BaseRef| {
+        let name = &b.class;
+        let field = base_field(name);
+        if b.is_virtual {
+            quote!((virtual #name))
+        } else {
+            quote!((#field))
+        }
+    };
+
+    let mut path = vec![step(from)];
+    let mut current = from.class.clone();
+    loop {
+        if current == *owner || !abstract_classes.contains(&&current) {
+            return path;
+        }
+        let Some((_, bases)) = graph.iter().find(|(name, _)| **name == current) else {
+            return path;
+        };
+        let Some(next) = bases.iter().find(|b| reaches(graph, &b.class, owner)) else {
+            return path;
+        };
+        // Reachable along the primary chain: method lookup can walk the rest by itself.
+        if bases.first().is_some_and(|first| first.class == next.class) {
+            return path;
+        }
+        path.push(step(next));
+        current = next.class.clone();
+    }
+}
+
 /// Walks the class graph to find whether `from` is, or derives from, `target`.
 fn reaches(graph: &[(&Ident, &Vec<BaseRef>)], from: &Ident, target: &Ident) -> bool {
     if from == target {
@@ -1173,6 +1254,11 @@ fn expand_methods(
         .map(|a| (&a.class, &a.direct_bases))
         .collect();
     let is_abstract = |c: &Ident| ancestors.iter().any(|a| a.class == *c && a.is_abstract);
+    let abstract_classes: Vec<&Ident> = ancestors
+        .iter()
+        .filter(|a| a.is_abstract)
+        .map(|a| &a.class)
+        .collect();
 
     // A malformed hierarchy is reported by `#[obj::class]`, which walks the same graph. Saying it
     // again here would just double every such error, so the interface trait is still emitted --
@@ -1202,14 +1288,26 @@ fn expand_methods(
                         format!("obj: no base of `{class}` reaches `{owner}`"),
                     ));
                 };
-                let base = &via.class;
-                let abstract_base = is_abstract(base);
-                if via.is_virtual {
-                    quote!((#base virtual #abstract_base))
+                let path = delegate_path(&graph, &abstract_classes, via, owner);
+                // The class the path lands on, which is what the call is qualified with when it
+                // implements the interface itself.
+                let landed = if path.len() == 1 {
+                    via.class.clone()
                 } else {
-                    let field = base_field(base);
-                    quote!((#base #field #abstract_base))
-                }
+                    // Re-walk to name it; the path was built from the same steps.
+                    let mut c = via.class.clone();
+                    for _ in 1..path.len() {
+                        let bases = graph.iter().find(|(n, _)| **n == c).map(|(_, b)| *b);
+                        if let Some(next) = bases.and_then(|b| {
+                            b.iter().find(|b| reaches(&graph, &b.class, owner)).cloned()
+                        }) {
+                            c = next.class;
+                        }
+                    }
+                    c
+                };
+                let landed_is_abstract = is_abstract(&landed);
+                quote!((#landed [#(#path)*] #landed_is_abstract))
             };
             calls.push(quote!(#mac! { #class, #delegate, [#(#provides)*] }));
 
@@ -1218,7 +1316,7 @@ fn expand_methods(
             // to the class subobject it wraps, which resolved the dispatch already.
             if layout.as_ref().is_some_and(|l| l.wrapped) {
                 let sub_field = base_field(class);
-                calls.push(quote!(#mac! { #complete, (#class #sub_field false), [] }));
+                calls.push(quote!(#mac! { #complete, (#class [(#sub_field)] false), [] }));
             }
         }
         Some(quote!(#(#calls)*))

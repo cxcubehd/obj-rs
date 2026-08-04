@@ -36,6 +36,26 @@
 //! Crucially, the reverse requires a complete object, which is what makes C++ slicing
 //! unrepresentable here.
 //!
+//! # Two spellings
+//!
+//! [`#[obj::class]`](macro@class) and [`#[obj::methods]`](macro@methods) are the implementation.
+//! [`obj::classes!`](macro@classes) is sugar over exactly those attributes — never a second
+//! implementation — and gives back `virtual`, `override` and `abstract` as keywords, a base list
+//! after `:`, and constructors with a base-initializer list.
+//!
+//! # What each piece does
+//!
+//! - [`Obj`], [`Shared`], [`ArcShared`], [`Ref`], [`RefMut`] — the handles, and the only things
+//!   through which methods dispatch virtually.
+//! - [`class`](mod@class) — what it means to be a class: [`Class`], [`Concrete`], [`SubclassOf`],
+//!   [`AnyObj`].
+//! - [`meta`] — the runtime class metadata a `dynamic_cast` consults.
+//! - [`vbase`] — virtual (shared) base classes, and the [`VBase`] link that reaches one.
+//! - [`dyn_traits`] — `Debug`, `Display`, `Clone`, `PartialEq`, `Eq` and `Hash` through a handle.
+//!
+//! Three runnable examples ship with the crate: `shapes` covers every feature end to end, `ast`
+//! builds an expression tree with the DSL, and `diamond` shows a shared base reached two ways.
+//!
 //! # Safety
 //!
 //! The `unsafe` lives in this crate and has three sources, all documented at their definitions:

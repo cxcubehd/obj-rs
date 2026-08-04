@@ -33,8 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      # Covers the `core::ptr::from_raw_parts` path that replaces the stable transmute.
-      - run: cargo test --workspace --features nightly
+      # Covers the `core::ptr::from_raw_parts` path that replaces the stable transmute. The `ui`
+      # tests are skipped for the same reason the MSRV and Miri jobs skip them: they match compiler
+      # diagnostics verbatim, and those drift between releases.
+      - run: cargo test --workspace --features nightly -- --skip ui
 
   msrv:
     name: minimum supported rust version

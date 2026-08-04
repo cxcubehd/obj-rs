@@ -238,3 +238,82 @@ fn downcast_from_a_secondary_base_to_the_concrete_class() {
     assert!((circle.r - 2.0).abs() < EPS);
     assert!(drawable.is::<Shape>(), "and it is a Shape too");
 }
+
+// ---------------------------------------------------------------- abstract intermediates
+//
+// Delegation has to reach an implementation through classes that provide none of their own. An
+// abstract class implements no interface, so there is no `<Base as ShapeDyn>` to hand the call
+// to, and method lookup only ever walks the *primary* base chain — so a virtual inherited from an
+// abstract intermediate's *secondary* base is the case that needs the delegation path to cross
+// the branch explicitly.
+
+#[obj::class(abstract)]
+pub struct Audible {
+    pub volume: u8,
+}
+
+#[obj::methods]
+impl Audible {
+    /// Declared on what will be a *secondary* base of an abstract intermediate.
+    #[obj(virtual)]
+    fn play(&self) -> String {
+        format!("beep at {}", self.volume)
+    }
+}
+
+/// Abstract, and overrides neither `area` (from its primary base) nor `play` (from its secondary).
+#[obj::class(extends(Shape, Audible), abstract)]
+pub struct Widget {
+    pub id: u32,
+}
+
+#[obj::methods]
+impl Widget {}
+
+#[obj::class(extends = Widget)]
+pub struct Button {
+    pub label: &'static str,
+}
+
+#[obj::methods]
+impl Button {
+    #[obj(override)]
+    fn area(&self) -> f64 {
+        7.0
+    }
+}
+
+fn button() -> Button {
+    Button {
+        widget: Widget {
+            shape: Shape { x: 1.0 },
+            audible: Audible { volume: 3 },
+            id: 9,
+        },
+        label: "ok",
+    }
+}
+
+#[test]
+fn a_virtual_inherited_through_an_abstract_intermediate() {
+    let b = Obj::<Button>::new(button());
+
+    // `Shape::scale` has a body and nobody below overrides it: reached through abstract `Widget`.
+    let mut b = b;
+    b.scale(2.0);
+    assert!((b.x - 2.0).abs() < EPS, "primary chain");
+
+    // `Audible::play` likewise, but it arrives through `Widget`'s *secondary* base.
+    assert_eq!(b.play(), "beep at 3", "secondary branch");
+    assert!((b.area() - 7.0).abs() < EPS, "Button's own override");
+}
+
+#[test]
+fn dispatch_through_a_base_handle_across_an_abstract_intermediate() {
+    let audible: Obj<Audible> = Obj::<Button>::new(button()).upcast();
+    assert_eq!(audible.play(), "beep at 3");
+    assert_eq!(audible.class().name, "Button");
+
+    let shape: Obj<Shape> = Obj::<Button>::new(button()).upcast();
+    assert!((shape.area() - 7.0).abs() < EPS);
+}
