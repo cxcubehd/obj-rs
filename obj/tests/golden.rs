@@ -664,18 +664,25 @@ fn sidecast_across_multiple_inheritance_keeps_polymorphism() {
 #[test]
 fn owning_downcast_returns_the_handle_on_failure() {
     let s: Obj<Shape> = Obj::<Square>::new(Square::new(1.0, 2.0)).upcast();
-    let s = s.downcast::<Circle>().err().expect("not a Circle");
+    // `Obj` is only `Debug` when the class opts in, so unwrap by pattern rather than `expect`.
+    let Err(s) = s.downcast::<Circle>() else {
+        panic!("a Square is not a Circle")
+    };
     // the original handle survived intact
     assert_eq!(s.class().name, "Square");
 
-    let sq: Obj<Square> = s.downcast::<Square>().ok().expect("is a Square");
+    let Ok(sq) = s.downcast::<Square>() else {
+        panic!("is a Square")
+    };
     assert!((sq.s - 2.0).abs() < EPS);
 }
 
 #[test]
 fn owning_downcast_preserves_the_allocation() {
     let s: Obj<Shape> = Obj::<Circle>::new(Circle::new(1.0, 2.0)).upcast();
-    let c: Obj<Circle> = s.downcast::<Circle>().ok().expect("is a Circle");
+    let Ok(c) = s.downcast::<Circle>() else {
+        panic!("is a Circle")
+    };
     assert!((c.r - 2.0).abs() < EPS);
     // dropping `c` must free with Circle's layout, recovered from the rebuilt vtable
     drop(c);

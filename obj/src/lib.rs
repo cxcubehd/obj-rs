@@ -49,6 +49,7 @@ extern crate alloc;
 
 pub mod cast;
 pub mod class;
+pub mod dyn_traits;
 mod handle;
 pub mod meta;
 
@@ -56,6 +57,7 @@ pub mod meta;
 pub mod __private;
 
 pub use class::{AnyObj, Class, Concrete, SubclassOf};
+pub use dyn_traits::{CloneObj, DynEq, DynHash, DynTotalEq};
 pub use handle::{ArcShared, Obj, Ref, RefMut, Shared, WeakArcShared, WeakShared};
 pub use meta::{BaseEntry, BaseTable, ClassId, ClassMeta, VTablePtr, MAX_BASES};
 #[doc(hidden)]

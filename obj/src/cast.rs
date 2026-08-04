@@ -51,6 +51,30 @@ pub(crate) unsafe fn rebuild_fat<D: ?Sized>(data: *const u8, vtable: VTablePtr) 
     core::ptr::from_raw_parts(data.cast::<()>(), meta)
 }
 
+/// Reads back the vtable half of an existing fat pointer.
+///
+/// Used when a new allocation is known to hold the *same* most-derived type as an existing handle
+/// — a virtual clone — so the handle's own vtable already describes it and no table lookup is
+/// needed.
+#[cfg(not(feature = "nightly"))]
+pub(crate) fn vtable_of<D: ?Sized>(ptr: *const D) -> VTablePtr {
+    let () = FatCheck::<D>::OK;
+    // SAFETY: `FatCheck` proves `*const D` is two words laid out as (data, vtable), so reading the
+    // second word yields the vtable that the compiler itself installed.
+    let parts: [*const (); 2] = unsafe { core::mem::transmute_copy(&ptr) };
+    VTablePtr(parts[1])
+}
+
+/// Reads back the vtable half of an existing fat pointer.
+#[cfg(feature = "nightly")]
+pub(crate) fn vtable_of<D: ?Sized>(ptr: *const D) -> VTablePtr {
+    let () = FatCheck::<D>::OK;
+    let meta = core::ptr::metadata(ptr);
+    // SAFETY: `D` is a `dyn` trait, so its metadata is a one-word `DynMetadata`, which is what
+    // `VTablePtr` wraps. `rebuild_fat` reverses this transmute symmetrically.
+    VTablePtr(unsafe { core::mem::transmute_copy(&meta) })
+}
+
 /// Locates the `T` *data* subobject inside `src`, applying the recorded byte offset.
 pub(crate) fn data_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*const T> {
     let entry = src.class_meta().find_base(TypeId::of::<T>())?;

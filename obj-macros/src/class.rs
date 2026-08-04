@@ -14,12 +14,15 @@ pub struct ClassArgs {
     pub bases: Vec<Ident>,
     /// Whether this class has pure virtual methods and so cannot be instantiated.
     pub is_abstract: bool,
+    /// Standard traits to carry on this class's interface, from `dyn_traits(..)`.
+    pub dyn_traits: Vec<Ident>,
 }
 
 impl Parse for ClassArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut bases = Vec::new();
         let mut is_abstract = false;
+        let mut dyn_traits: Vec<Ident> = Vec::new();
         while !input.is_empty() {
             let look = input.lookahead1();
             if look.peek(Token![abstract]) {
@@ -42,10 +45,40 @@ impl Parse for ClassArgs {
                             "obj: write `extends = Base` or `extends(Primary, Secondary, ..)`",
                         ));
                     }
+                } else if key == "dyn_traits" {
+                    if !input.peek(syn::token::Paren) {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "obj: write `dyn_traits(Debug, Clone, ..)`",
+                        ));
+                    }
+                    let inner;
+                    syn::parenthesized!(inner in input);
+                    let listed = Punctuated::<Ident, Token![,]>::parse_terminated(&inner)?;
+                    for t in listed {
+                        if !DYN_TRAITS.contains(&t.to_string().as_str()) {
+                            return Err(syn::Error::new(
+                                t.span(),
+                                format!(
+                                    "obj: `{t}` is not one of the traits `dyn_traits` can carry \
+                                     through a handle; expected one of {}",
+                                    DYN_TRAITS.join(", "),
+                                ),
+                            ));
+                        }
+                        if dyn_traits.contains(&t) {
+                            return Err(syn::Error::new(
+                                t.span(),
+                                "obj: duplicate `dyn_traits` entry",
+                            ));
+                        }
+                        dyn_traits.push(t);
+                    }
                 } else {
                     return Err(syn::Error::new(
                         key.span(),
-                        "obj: expected `extends = Base`, `extends(..)` or `abstract`",
+                        "obj: expected `extends = Base`, `extends(..)`, `abstract` or \
+                         `dyn_traits(..)`",
                     ));
                 }
             } else {
@@ -64,7 +97,26 @@ impl Parse for ClassArgs {
             seen.push(b.to_string());
         }
 
-        Ok(ClassArgs { bases, is_abstract })
+        // `Eq` is a marker on top of `PartialEq`, exactly as in `core`, so asking for it alone
+        // would generate an impl whose supertrait is unsatisfied far from here.
+        if let Some(eq) = dyn_traits.iter().find(|t| *t == "Eq") {
+            if !dyn_traits.iter().any(|t| t == "PartialEq") {
+                return Err(syn::Error::new(
+                    eq.span(),
+                    "obj: `dyn_traits(Eq)` also needs `PartialEq`, since `Eq` only marks an \
+                     existing `PartialEq` as total",
+                ));
+            }
+        }
+
+        // Emit in a fixed order so the generated code does not depend on how the list was written.
+        sort_dyn_traits(&mut dyn_traits);
+
+        Ok(ClassArgs {
+            bases,
+            is_abstract,
+            dyn_traits,
+        })
     }
 }
 
@@ -100,6 +152,7 @@ pub fn expand(args: ClassArgs, mut item: ItemStruct) -> syn::Result<TokenStream>
     let ancestors_mac = ancestors_macro(&class);
     let is_abstract = args.is_abstract;
     let base_list = &args.bases;
+    let dyn_traits = &args.dyn_traits;
 
     // Each class contributes its own entry to a list built by walking up the chain. Secondary
     // bases are queued as `pending`; the emitter resumes the walk through each of them in turn.
@@ -114,7 +167,7 @@ pub fn expand(args: ClassArgs, mut item: ItemStruct) -> syn::Result<TokenStream>
                         #primary_mac! {
                             {$($pre)*}
                             [$($pend)* #(#secondaries)*]
-                            [$($acc)* (#class #is_abstract #vis [#(#base_list)*])]
+                            [$($acc)* (#class #is_abstract #vis [#(#base_list)*] [#(#dyn_traits)*])]
                         }
                     };
                 }
@@ -128,7 +181,7 @@ pub fn expand(args: ClassArgs, mut item: ItemStruct) -> syn::Result<TokenStream>
                     ::obj::__obj_emit! {
                         $($pre)*
                         pending [$($pend)*]
-                        ancestors [$($acc)* (#class #is_abstract #vis [])]
+                        ancestors [$($acc)* (#class #is_abstract #vis [] [#(#dyn_traits)*])]
                     }
                 };
             }

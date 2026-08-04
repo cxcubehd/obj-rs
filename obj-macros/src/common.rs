@@ -68,6 +68,22 @@ pub fn base_field(base: &Ident) -> Ident {
     Ident::new(&to_snake_case(&base.to_string()), Span::call_site())
 }
 
+/// The standard traits a class may opt into with `#[obj::class(dyn_traits(..))]`.
+///
+/// Listed in the order they are emitted, so generated code is deterministic regardless of the
+/// order the user wrote them in.
+pub const DYN_TRAITS: &[&str] = &["Debug", "Display", "Clone", "PartialEq", "Eq", "Hash"];
+
+/// Puts `dyn_traits` entries into [`DYN_TRAITS`] order.
+pub fn sort_dyn_traits(traits: &mut [Ident]) {
+    traits.sort_by_key(|t| {
+        DYN_TRAITS
+            .iter()
+            .position(|known| t == *known)
+            .unwrap_or(usize::MAX)
+    });
+}
+
 /// `HttpRequest` -> `http_request`
 pub fn to_snake_case(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 4);

@@ -11,11 +11,32 @@
 use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak as RcWeak};
 use alloc::sync::{Arc, Weak as ArcWeak};
+use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::ops::{Deref, DerefMut};
 
-use crate::cast::{data_ptr_of, dyn_ptr_of, is_a};
+use crate::cast::{data_ptr_of, dyn_ptr_of, is_a, rebuild_fat, vtable_of};
 use crate::class::{Class, Concrete, SubclassOf};
+use crate::dyn_traits::{CloneObj, DynEq, DynHash, DynTotalEq};
 use crate::meta::ClassMeta;
+
+/// Deep-copies the object behind a polymorphic reference, preserving its most-derived class.
+///
+/// No base-table lookup is needed: [`CloneObj`] promises the copy has the same most-derived type
+/// as `src`, so `src`'s own vtable already describes it.
+fn clone_dyn<C: Class>(src: &C::Dyn) -> Box<C::Dyn>
+where
+    C::Dyn: CloneObj,
+{
+    let vtable = vtable_of(core::ptr::from_ref(src));
+    let raw = src.clone_raw();
+    // SAFETY: `CloneObj` guarantees `raw` came from `Box::into_raw` on a fresh object of the same
+    // most-derived type as `src`, so pairing it with `src`'s vtable is coherent, and the size,
+    // alignment and drop glue that `Box` recovers are the ones the allocation was made with.
+    let fat = unsafe { rebuild_fat::<C::Dyn>(raw.cast_const(), vtable) };
+    // SAFETY: as above. `clone_raw` handed over ownership of the allocation.
+    unsafe { Box::from_raw(fat.cast_mut()) }
+}
 
 /// An owning polymorphic handle — the `obj` analogue of C++'s `unique_ptr<C>`.
 ///
@@ -491,4 +512,145 @@ impl<C: Class> Clone for WeakArcShared<C> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
+}
+
+// ------------------------------------------------------------------ virtual clone
+
+impl<C: Class> Clone for Obj<C>
+where
+    C::Dyn: CloneObj,
+{
+    /// Deep-copies the object, preserving its most-derived class.
+    ///
+    /// Cloning an `Obj<Shape>` that holds a `Circle` yields an `Obj<Shape>` holding a `Circle` —
+    /// the C++ "virtual clone" idiom. Available once the class opts in with
+    /// `#[obj::class(dyn_traits(Clone))]`.
+    fn clone(&self) -> Self {
+        Obj(clone_dyn::<C>(&self.0))
+    }
+}
+
+impl<C: Class> Ref<'_, C> {
+    /// Deep-copies the referent into an owned handle, preserving its most-derived class.
+    #[must_use]
+    pub fn clone_obj(self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(self.0))
+    }
+}
+
+impl<C: Class> RefMut<'_, C> {
+    /// Deep-copies the referent into an owned handle, preserving its most-derived class.
+    #[must_use]
+    pub fn clone_obj(&self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(self.0))
+    }
+}
+
+impl<C: Class> Shared<C> {
+    /// Deep-copies the object into a new, unshared handle.
+    ///
+    /// [`Clone`](Self::clone) shares the existing object by bumping its refcount; this copies it.
+    #[must_use]
+    pub fn clone_obj(&self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(&self.0))
+    }
+}
+
+impl<C: Class> ArcShared<C> {
+    /// Deep-copies the object into a new, unshared handle.
+    ///
+    /// [`Clone`](Self::clone) shares the existing object by bumping its refcount; this copies it.
+    #[must_use]
+    pub fn clone_obj(&self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(C::send_as_dyn(&self.0)))
+    }
+}
+
+// ------------------------------------------------------- formatting, equality and hashing
+//
+// Each handle forwards to its referent, so the impls are available exactly when the class opted
+// into the corresponding `dyn_traits(..)` entry.
+
+/// Forwards `Debug` and `Display` from a handle to the object behind it.
+macro_rules! forward_fmt {
+    ($($name:ident $(<$lt:lifetime>)?, $target:ident, |$s:ident| $get:expr;)*) => {$(
+        impl<$($lt,)? C: Class> fmt::Debug for $name<$($lt,)? C>
+        where
+            C::$target: fmt::Debug,
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let $s = self;
+                fmt::Debug::fmt($get, f)
+            }
+        }
+
+        impl<$($lt,)? C: Class> fmt::Display for $name<$($lt,)? C>
+        where
+            C::$target: fmt::Display,
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let $s = self;
+                fmt::Display::fmt($get, f)
+            }
+        }
+    )*};
+}
+
+forward_fmt! {
+    Obj, Dyn, |s| &*s.0;
+    Ref<'a>, Dyn, |s| s.0;
+    RefMut<'a>, Dyn, |s| &*s.0;
+    Shared, Dyn, |s| &*s.0;
+    ArcShared, SendDyn, |s| &*s.0;
+}
+
+/// Forwards `PartialEq`, `Eq` and `Hash` from a handle to the object behind it.
+///
+/// Equality is heterogeneous — objects of different most-derived classes are never equal — and the
+/// class identity is folded into the hash to match, so the two stay consistent.
+macro_rules! forward_cmp {
+    ($($name:ident $(<$lt:lifetime>)?, $target:ident, |$s:ident| $get:expr;)*) => {$(
+        impl<$($lt,)? C: Class> PartialEq for $name<$($lt,)? C>
+        where
+            C::$target: DynEq,
+        {
+            fn eq(&self, other: &Self) -> bool {
+                let ($s, o) = (self, other);
+                let this: &C::$target = $get;
+                let $s = o;
+                this.dyn_eq($get.as_any())
+            }
+        }
+
+        impl<$($lt,)? C: Class> Eq for $name<$($lt,)? C> where C::$target: DynTotalEq {}
+
+        impl<$($lt,)? C: Class> Hash for $name<$($lt,)? C>
+        where
+            C::$target: DynHash,
+        {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                let $s = self;
+                $get.dyn_hash(state);
+            }
+        }
+    )*};
+}
+
+forward_cmp! {
+    Obj, Dyn, |s| &*s.0;
+    Ref<'a>, Dyn, |s| s.0;
+    Shared, Dyn, |s| &*s.0;
+    ArcShared, SendDyn, |s| &*s.0;
 }

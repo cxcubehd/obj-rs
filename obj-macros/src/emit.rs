@@ -16,12 +16,13 @@ use syn::{Ident, LitBool, LitStr, Token, TraitItemFn, Visibility};
 
 use crate::common::*;
 
-/// One entry of the accumulated list: `(Class is_abstract vis [DirectBases..])`.
+/// One entry of the accumulated list: `(Class is_abstract vis [DirectBases..] [DynTraits..])`.
 pub struct Ancestor {
     pub class: Ident,
     pub is_abstract: bool,
     pub vis: Visibility,
     pub direct_bases: Vec<Ident>,
+    pub dyn_traits: Vec<Ident>,
 }
 
 impl Parse for Ancestor {
@@ -37,13 +38,109 @@ impl Parse for Ancestor {
         while !bases.is_empty() {
             direct_bases.push(bases.parse()?);
         }
+        let traits;
+        syn::bracketed!(traits in content);
+        let mut dyn_traits = Vec::new();
+        while !traits.is_empty() {
+            dyn_traits.push(traits.parse()?);
+        }
         Ok(Ancestor {
             class,
             is_abstract,
             vis,
             direct_bases,
+            dyn_traits,
         })
     }
+}
+
+/// The trait a `dyn_traits(..)` entry becomes a supertrait of the class's interface.
+///
+/// `Debug` and `Display` are object-safe already and pass straight through; the rest name their
+/// object-safe shim from [`obj::dyn_traits`](../obj/dyn_traits/index.html).
+fn dyn_trait_path(name: &Ident) -> Option<TokenStream> {
+    Some(match name.to_string().as_str() {
+        "Debug" => quote!(::core::fmt::Debug),
+        "Display" => quote!(::core::fmt::Display),
+        "Clone" => quote!(::obj::CloneObj),
+        "PartialEq" => quote!(::obj::DynEq),
+        "Eq" => quote!(::obj::DynTotalEq),
+        "Hash" => quote!(::obj::DynHash),
+        _ => return None,
+    })
+}
+
+/// The impl that backs a `dyn_traits(..)` entry for a concrete class.
+///
+/// `ty` is the type that actually implements the class's interface, which is the class itself
+/// today and its `Complete` wrapper once virtual bases are in play.
+fn dyn_trait_impl(name: &Ident, ty: &TokenStream) -> Option<TokenStream> {
+    Some(match name.to_string().as_str() {
+        // Object-safe as they stand: the supertrait is the whole mechanism.
+        "Debug" | "Display" => return None,
+        "Clone" => quote! {
+            // SAFETY: the clone is produced by `<#ty as Clone>::clone`, so it has exactly the
+            // most-derived type of `self`, which is what `CloneObj` requires.
+            unsafe impl ::obj::CloneObj for #ty {
+                #[inline]
+                fn clone_raw(&self) -> *mut u8 {
+                    ::obj::__private::Box::into_raw(::obj::__private::Box::new(
+                        <#ty as ::obj::__private::Clone>::clone(self),
+                    ))
+                    .cast::<u8>()
+                }
+            }
+        },
+        "PartialEq" => quote! {
+            impl ::obj::DynEq for #ty {
+                #[inline]
+                fn as_any(&self) -> &dyn ::obj::__private::Any { self }
+                #[inline]
+                fn dyn_eq(&self, other: &dyn ::obj::__private::Any) -> bool {
+                    match other.downcast_ref::<#ty>() {
+                        ::core::option::Option::Some(o) => {
+                            <#ty as ::obj::__private::PartialEq>::eq(self, o)
+                        }
+                        ::core::option::Option::None => false,
+                    }
+                }
+            }
+        },
+        "Eq" => quote!(impl ::obj::DynTotalEq for #ty {}),
+        "Hash" => quote! {
+            impl ::obj::DynHash for #ty {
+                #[inline]
+                fn dyn_hash(&self, mut state: &mut dyn ::obj::__private::Hasher) {
+                    // Fold in the class identity first, so two objects of different classes hash
+                    // differently even when their fields agree -- matching `DynEq`, which never
+                    // calls them equal.
+                    ::obj::__private::Hash::hash(
+                        &::obj::__private::TypeId::of::<#ty>(),
+                        &mut state,
+                    );
+                    ::obj::__private::Hash::hash(self, &mut state);
+                }
+            }
+        },
+        _ => return None,
+    })
+}
+
+/// Every `dyn_traits(..)` entry declared anywhere in this class's ancestry.
+///
+/// A subclass has to generate the shim impls for traits its *bases* opted into, because the
+/// interface it implements carries them as supertraits.
+fn inherited_dyn_traits(ancestors: &[&Ancestor]) -> Vec<Ident> {
+    let mut out: Vec<Ident> = Vec::new();
+    for a in ancestors {
+        for t in &a.dyn_traits {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+    }
+    sort_dyn_traits(&mut out);
+    out
 }
 
 pub enum Kind {
@@ -219,8 +316,14 @@ pub fn expand(input: EmitInput) -> syn::Result<TokenStream> {
             } => quote!(methods #class { #virtual_sigs } provides [#(#provides)*]),
         };
         let acc = ancestors_raw.iter().map(|a| {
-            let (c, ab, v, b) = (&a.class, a.is_abstract, &a.vis, &a.direct_bases);
-            quote!((#c #ab #v [#(#b)*]))
+            let (c, ab, v, b, d) = (
+                &a.class,
+                a.is_abstract,
+                &a.vis,
+                &a.direct_bases,
+                &a.dyn_traits,
+            );
+            quote!((#c #ab #v [#(#b)*] [#(#d)*]))
         });
         return Ok(quote! {
             #next_mac! { {#prefix} [#(#rest)*] [#(#acc)*] }
@@ -466,6 +569,19 @@ fn expand_class(
         }
     });
 
+    // The shim impls behind `dyn_traits(..)`. Abstract classes implement no interface, so nothing
+    // requires these of them -- and demanding `Clone` or `PartialEq` of a class that can never be
+    // instantiated would be a pointless bound on the user.
+    let self_ty = quote!(#class);
+    let dyn_trait_impls: Vec<TokenStream> = if is_abstract {
+        Vec::new()
+    } else {
+        inherited_dyn_traits(ancestors)
+            .iter()
+            .filter_map(|t| dyn_trait_impl(t, &self_ty))
+            .collect()
+    };
+
     let concrete = (!is_abstract).then(|| {
         quote! {
             unsafe impl ::obj::Concrete for #class {
@@ -573,6 +689,7 @@ fn expand_class(
 
         #(#upcasts)*
         #concrete
+        #(#dyn_trait_impls)*
     })
 }
 
@@ -602,12 +719,21 @@ fn expand_methods(
 
     // The interface's supertraits mirror the class's bases -- every base, not just the primary --
     // so `dyn Derived` upcasts to `dyn Base` for free along any branch.
-    let supertraits = if me.direct_bases.is_empty() {
+    let mut supertraits = if me.direct_bases.is_empty() {
         quote!(::obj::AnyObj)
     } else {
         let each = me.direct_bases.iter().map(iface_trait);
         quote!(#(#each)+*)
     };
+
+    // Only this class's *own* `dyn_traits(..)` are added here: a subclass inherits them through
+    // its base's interface, which is already a supertrait.
+    for t in &me.dyn_traits {
+        let path = dyn_trait_path(t).ok_or_else(|| {
+            syn::Error::new(t.span(), format!("obj: unknown `dyn_traits` entry `{t}`"))
+        })?;
+        supertraits = quote!(#supertraits + #path);
+    }
 
     let graph: Vec<(&Ident, &Vec<Ident>)> = ancestors
         .iter()

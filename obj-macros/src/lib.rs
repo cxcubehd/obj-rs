@@ -26,6 +26,29 @@ mod methods;
 /// The struct is given `#[repr(C)]` and, when it has a base, the base subobject is inserted as its
 /// first field. Every class must also have an `#[obj::methods]` block, which declares its virtual
 /// methods; write an empty one if it has none.
+///
+/// # Standard traits
+///
+/// `dyn_traits(..)` carries a standard trait through every handle to the class, and down to every
+/// subclass:
+///
+/// ```ignore
+/// #[obj::class(abstract, dyn_traits(Debug, Clone, PartialEq, Eq, Hash))]
+/// #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// pub struct Shape { pub x: i32 }
+/// ```
+///
+/// `Debug` and `Display` are object-safe, so they simply become supertraits of the class's
+/// interface. `Clone`, `PartialEq`, `Eq` and `Hash` are not, so the macro generates the
+/// object-safe shims in [`obj::dyn_traits`](../obj/dyn_traits/index.html) instead:
+///
+/// - `Clone` gives `Obj<C>: Clone` and a `clone_obj()` on every handle. The copy is of the
+///   **most-derived** class, which is the C++ "virtual clone" idiom.
+/// - `PartialEq` compares heterogeneously: objects of different classes are never equal.
+/// - `Hash` folds the class identity in first, so it agrees with that rule.
+///
+/// The class must implement the trait itself — usually by `#[derive]`, which must be written
+/// *below* `#[obj::class]` so it sees the injected base field.
 #[proc_macro_attribute]
 pub fn class(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as class::ClassArgs);
