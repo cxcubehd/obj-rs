@@ -72,7 +72,7 @@ pub use handle::{ArcShared, Obj, Ref, RefMut, Shared, WeakArcShared, WeakShared}
 pub use meta::{BaseEntry, BaseTable, ClassId, ClassMeta, VTablePtr, MAX_BASES};
 #[doc(hidden)]
 pub use obj_macros::__obj_emit;
-pub use obj_macros::{class, methods};
+pub use obj_macros::{class, classes, methods};
 pub use vbase::VBase;
 
 /// Captures the vtable produced by coercing a concrete type to a `dyn` interface.

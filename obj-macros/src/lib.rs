@@ -7,6 +7,7 @@ use syn::parse_macro_input;
 
 mod class;
 mod common;
+mod dsl;
 mod emit;
 mod methods;
 
@@ -113,6 +114,52 @@ pub fn class(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as methods::MethodsInput);
     methods::expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Declares whole classes in one block, C++-style.
+///
+/// ```ignore
+/// obj::classes! {
+///     pub abstract class Shape dyn_traits(Debug) {
+///         pub x: f64,
+///
+///         virtual fn area(&self) -> f64;                    // pure virtual
+///         virtual fn scale(&mut self, k: f64) { self.x *= k; }
+///         fn position(&self) -> f64 { self.x }              // non-virtual
+///     }
+///
+///     pub class Circle : Shape, virtual Drawable {
+///         pub r: f64,
+///
+///         ctor new(x: f64, r: f64) : Shape(x), virtual Drawable(true) { r }
+///
+///         override fn area(&self) -> f64 { PI * self.r * self.r }
+///     }
+/// }
+/// ```
+///
+/// This is sugar: it expands to the [`class`] and [`methods`] attributes and nothing else, so both
+/// spellings produce identical code and there is only one implementation to trust. What it buys is
+/// the parts that read badly as attributes — `virtual`, `override` and `abstract` as real keywords,
+/// a base list after `:`, and constructors with a base-initializer list.
+///
+/// # Constructors
+///
+/// `ctor <name>(<params>) : <base initialisers> { <own fields> }` becomes an inherent function.
+/// Each initialiser is either `Base(args)`, which calls that base's own `new`, or `Base { .. }`,
+/// which writes it out. The braces at the end hold this class's own fields, exactly as in a struct
+/// literal.
+///
+/// Marking an initialiser `virtual` makes the constructor a *most-derived* one: it returns the
+/// complete object with each shared base placed once, mirroring the C++ rule that only the
+/// most-derived constructor initialises virtual bases. List shared bases in the order they appear
+/// in the hierarchy.
+#[proc_macro]
+pub fn classes(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as dsl::Dsl);
+    dsl::expand(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

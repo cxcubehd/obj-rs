@@ -96,6 +96,7 @@ jobs:
           --test multiple_inheritance
           --test shared_handles
           --test std_traits
+          --test dsl
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
       - name: tree borrows, whole workspace
