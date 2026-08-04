@@ -16,16 +16,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, beta]
+        include:
+          # The trybuild UI snapshots record one compiler's exact diagnostic wording, so they run
+          # on stable alone. Beta carries the *next* stable's wording, so letting it check them
+          # turns every upstream diagnostic reword into a red build here, six weeks early.
+          - rust: stable
+            ui: ""
+          - rust: beta
+            ui: "-- --skip ui"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      # Not `--all-features`: the `nightly` feature turns on `feature(ptr_metadata)`, which a
-      # stable compiler rejects outright. It is exercised by the `nightly` job below.
-      - run: cargo test --workspace
-      - run: cargo test -p obj --no-default-features --features std
+      # Not `--all-features`: the `nightly` feature turns on `#![feature(ptr_metadata)]`, which is
+      # rejected outright on these channels. The `nightly` job below covers it instead.
+      - run: cargo test --workspace ${{ matrix.ui }}
+      - run: cargo test --workspace --no-default-features ${{ matrix.ui }}
 
   nightly:
     name: nightly feature
@@ -33,10 +40,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      # Covers the `core::ptr::from_raw_parts` path that replaces the stable transmute. The `ui`
-      # tests are skipped for the same reason the MSRV and Miri jobs skip them: they match compiler
-      # diagnostics verbatim, and those drift between releases.
-      - run: cargo test --workspace --features nightly -- --skip ui
+      # `--skip ui`: trybuild compares against stable's exact diagnostics, so the UI tests belong
+      # to the `test` job. Everything else exercises the `from_raw_parts` fat-pointer path.
+      - run: cargo test --workspace --all-features -- --skip ui
 
   msrv:
     name: minimum supported rust version
@@ -69,7 +75,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
+      # `--all-features` would pull in the nightly-only feature; see the `test` job.
       - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --no-default-features
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -102,7 +110,14 @@ jobs:
           --test non_send_class
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+      # Tree borrows covers everything, virtual bases included, and is the model that can.
       - name: tree borrows, whole workspace
         run: cargo miri test --workspace -- --skip ui
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+      # The `nightly` feature rebuilds fat pointers a different way, so it is a distinct unsafe
+      # path and needs its own run.
+      - name: tree borrows, nightly fat-pointer path
+        run: cargo miri test --workspace --all-features -- --skip ui
         env:
           MIRIFLAGS: -Zmiri-tree-borrows

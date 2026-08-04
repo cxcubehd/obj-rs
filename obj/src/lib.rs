@@ -70,6 +70,14 @@
 //! `-Zmiri-strict-provenance`; virtual bases cannot be, because reaching a shared base means
 //! addressing a *sibling* of the subobject you hold and a reference grants permission for its own
 //! subobject only. Those are checked under Tree Borrows instead — see [`VBase::resolve`].
+//!
+//! # Features
+//!
+//! - `std` (default) — reserved for `std`-only conveniences; the crate is `no_std + alloc`
+//!   without it.
+//! - `nightly` — rebuilds fat pointers with `core::ptr::from_raw_parts` rather than a transmute.
+//!   **Nightly-only**: it enables `#![feature(ptr_metadata)]`, so `--all-features` does not build
+//!   on stable or beta.
 
 #![no_std]
 #![cfg_attr(feature = "nightly", feature(ptr_metadata))]
