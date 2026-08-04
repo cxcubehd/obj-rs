@@ -16,7 +16,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, beta]
+        include:
+          # The trybuild UI snapshots record one compiler's exact diagnostic wording, so they run
+          # on stable alone. Beta carries the *next* stable's wording, so letting it check them
+          # turns every upstream diagnostic reword into a red build here, six weeks early.
+          - rust: stable
+            ui: ""
+          - rust: beta
+            ui: "-- --skip ui"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -24,8 +31,8 @@ jobs:
           toolchain: ${{ matrix.rust }}
       # Not `--all-features`: the `nightly` feature turns on `#![feature(ptr_metadata)]`, which is
       # rejected outright on these channels. The `nightly` job below covers it instead.
-      - run: cargo test --workspace
-      - run: cargo test --workspace --no-default-features
+      - run: cargo test --workspace ${{ matrix.ui }}
+      - run: cargo test --workspace --no-default-features ${{ matrix.ui }}
 
   nightly:
     name: nightly feature

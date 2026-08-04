@@ -1,14 +1,14 @@
-error[E0599]: no function or associated item named `area` found for struct `Shape` in the current scope
+error[E0599]: no associated function or constant named `area` found for struct `Shape` in the current scope
   --> tests/ui/missing_pure_virtual_override.rs:10:8
    |
  3 |   pub struct Shape {
-   |   ---------------- function or associated item `area` not found for this struct
+   |   ---------------- associated function or constant `area` not found for this struct
 ...
  8 |   impl Shape {
    |  ______-
  9 | |     #[obj(virtual)]
 10 | |     fn area(&self) -> f64;
-   | |       -^^^^ function or associated item not found in `Shape`
+   | |       -^^^^ associated function or constant not found in `Shape`
    | |_______|
    |
 ...
