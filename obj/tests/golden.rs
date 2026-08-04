@@ -20,7 +20,7 @@ use core::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use obj::{AnyObj, BaseEntry, Class, ClassMeta, Concrete, Obj, Ref, SubclassOf};
+use obj::{AnyObj, ArcCoerce, BaseEntry, Class, ClassMeta, Concrete, Obj, Ref, SubclassOf};
 
 // =====================================================================================
 // class Shape { x: f64; virtual area() = 0; virtual scale(k); fn describe(); }
@@ -348,10 +348,15 @@ unsafe impl Concrete for Circle {
     fn rc_into_dyn(value: Rc<Circle>) -> Rc<dyn CircleDyn> {
         value
     }
-    fn arc_into_dyn(value: Arc<Circle>) -> Arc<dyn CircleDyn + Send + Sync>
-    where
-        Circle: Send + Sync,
-    {
+}
+
+// Generic on purpose: the `Send + Sync` bound rides on `S`, so a class that is not thread-safe
+// simply does not get this impl rather than failing to compile. See `ArcCoerce`.
+unsafe impl<S> ArcCoerce<S> for dyn CircleDyn + Send + Sync
+where
+    S: CircleDyn + Send + Sync + Sized + 'static,
+{
+    fn arc_coerce(value: Arc<S>) -> Arc<dyn CircleDyn + Send + Sync> {
         value
     }
 }
@@ -549,10 +554,15 @@ unsafe impl Concrete for Square {
     fn rc_into_dyn(value: Rc<Square>) -> Rc<dyn SquareDyn> {
         value
     }
-    fn arc_into_dyn(value: Arc<Square>) -> Arc<dyn SquareDyn + Send + Sync>
-    where
-        Square: Send + Sync,
-    {
+}
+
+// Generic on purpose: the `Send + Sync` bound rides on `S`, so a class that is not thread-safe
+// simply does not get this impl rather than failing to compile. See `ArcCoerce`.
+unsafe impl<S> ArcCoerce<S> for dyn SquareDyn + Send + Sync
+where
+    S: SquareDyn + Send + Sync + Sized + 'static,
+{
+    fn arc_coerce(value: Arc<S>) -> Arc<dyn SquareDyn + Send + Sync> {
         value
     }
 }

@@ -124,6 +124,28 @@ fn check_dispatchable(f: &TraitItemFn) -> syn::Result<()> {
     Ok(())
 }
 
+/// Emits a failed `#[obj::methods]` as the error plus a stand-in interface.
+///
+/// The `#[obj::class]` attribute next to it generates `type Dyn = dyn ShapeDyn` and several impls
+/// over that trait, so swallowing the trait entirely turns one clear error into a pile of "cannot
+/// find trait `ShapeDyn`". An empty interface satisfies all of those uses.
+pub fn recover(err: syn::Error, class: &Ident) -> TokenStream {
+    let (iface, sub_tr, mac) = (iface_trait(class), sub_trait(class), iface_macro(class));
+    let err = err.into_compile_error();
+    quote! {
+        #err
+
+        #[doc(hidden)]
+        #[allow(missing_docs)]
+        pub trait #iface: ::obj::AnyObj + #sub_tr {}
+        impl<T: ::obj::AnyObj + #sub_tr + ?Sized> #iface for T {}
+
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #mac { ($($ignored:tt)*) => {}; }
+    }
+}
+
 pub fn expand(input: MethodsInput) -> syn::Result<TokenStream> {
     let class = input.self_ty;
     let iface_mac = iface_macro(&class);

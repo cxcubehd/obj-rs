@@ -632,7 +632,13 @@ pub fn expand(input: EmitInput) -> syn::Result<TokenStream> {
         .collect();
 
     match &kind {
-        Kind::Class { bases } => expand_class(&class, bases, &ancestors),
+        // On failure, still emit the subobject-accessor trait. It depends on nothing that could
+        // have gone wrong, and the interface trait next door names it as a supertrait, so leaving
+        // it out turns one actionable error into two.
+        Kind::Class { bases } => match expand_class(&class, bases, &ancestors) {
+            Ok(tokens) => Ok(tokens),
+            Err(err) => Ok(class_scaffold(&class, &ancestors, &err)),
+        },
         Kind::Methods {
             virtual_sigs,
             provides,
@@ -746,6 +752,24 @@ fn self_entry(class: &Ident, complete: &Ident, is_abstract: bool) -> TokenStream
             id: ::obj::__private::TypeId::of::<#class>,
             data_offset: 0,
             dyn_vtable: #vtable,
+        }
+    }
+}
+
+/// The error, plus the parts of a class that cannot themselves have failed.
+fn class_scaffold(class: &Ident, ancestors: &[&Ancestor], err: &syn::Error) -> TokenStream {
+    let vis = ancestors
+        .first()
+        .map_or(Visibility::Inherited, |a| a.vis.clone());
+    let (sub_tr, sub_fn, sub_fn_mut) = (sub_trait(class), sub_fn(class), sub_fn_mut(class));
+    let err = err.to_compile_error();
+    quote! {
+        #err
+        #[doc(hidden)]
+        #[allow(missing_docs)]
+        #vis trait #sub_tr {
+            fn #sub_fn(&self) -> &#class;
+            fn #sub_fn_mut(&mut self) -> &mut #class;
         }
     }
 }
@@ -980,13 +1004,20 @@ fn expand_class(
                 fn rc_into_dyn(
                     value: ::obj::__private::Rc<#complete>,
                 ) -> ::obj::__private::Rc<dyn #iface> { value }
+            }
+
+            // Generic on purpose: the `Send + Sync` bound rides on `S` rather than on the class,
+            // so a class that is not thread-safe -- one holding an `Obj` child, say -- simply does
+            // not get this impl, instead of failing to compile.
+            // SAFETY: the body is a plain unsizing coercion.
+            unsafe impl<S> ::obj::ArcCoerce<S> for dyn #iface + Send + Sync
+            where
+                S: #iface + Send + Sync + Sized + 'static,
+            {
                 #[inline]
-                fn arc_into_dyn(
-                    value: ::obj::__private::Arc<#complete>,
-                ) -> ::obj::__private::Arc<dyn #iface + Send + Sync>
-                where
-                    #complete: Send + Sync,
-                { value }
+                fn arc_coerce(
+                    value: ::obj::__private::Arc<S>,
+                ) -> ::obj::__private::Arc<dyn #iface + Send + Sync> { value }
             }
         }
     });
@@ -1143,12 +1174,15 @@ fn expand_methods(
         .collect();
     let is_abstract = |c: &Ident| ancestors.iter().any(|a| a.class == *c && a.is_abstract);
 
-    let layout = Layout::of(class, me.is_abstract, ancestors)?;
-    let complete = &layout.complete;
+    // A malformed hierarchy is reported by `#[obj::class]`, which walks the same graph. Saying it
+    // again here would just double every such error, so the interface trait is still emitted --
+    // keeping its name resolvable -- and only the impls are dropped.
+    let layout = Layout::of(class, me.is_abstract, ancestors).ok();
+    let complete = layout.as_ref().map(|l| l.complete.clone());
 
     // One interface impl per ancestor. Each names the base that non-overridden methods are
     // delegated to, which is the direct base through which this class reaches that ancestor.
-    let iface_impls = if me.is_abstract {
+    let iface_impls = if me.is_abstract || layout.is_none() {
         None
     } else {
         let mut calls = Vec::new();
@@ -1182,7 +1216,7 @@ fn expand_methods(
             // The complete object is what a live handle points at, so it is what has to implement
             // every interface. It owns no behaviour of its own -- it forwards each method straight
             // to the class subobject it wraps, which resolved the dispatch already.
-            if layout.wrapped {
+            if layout.as_ref().is_some_and(|l| l.wrapped) {
                 let sub_field = base_field(class);
                 calls.push(quote!(#mac! { #complete, (#class #sub_field false), [] }));
             }

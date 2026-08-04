@@ -23,5 +23,11 @@ nightly = []
 [dev-dependencies]
 trybuild = "1.0"
 
+# Timed directly rather than through a benchmark framework, so `cargo bench` needs no extra
+# dependencies and CI does not pay to compile one.
+[[bench]]
+name = "dispatch"
+harness = false
+
 [lints]
 workspace = true

@@ -90,11 +90,27 @@ pub unsafe trait Concrete: Class {
 
     /// Coerces a reference-counted complete object to this class's interface.
     fn rc_into_dyn(value: Rc<Self::Complete>) -> Rc<Self::Dyn>;
+}
 
-    /// Coerces an atomically reference-counted complete object to the thread-safe interface.
-    fn arc_into_dyn(value: Arc<Self::Complete>) -> Arc<Self::SendDyn>
-    where
-        Self::Complete: Send + Sync;
+/// Coerces `Arc<S>` to `Arc<Self>`, where `Self` is a class's thread-safe interface.
+///
+/// This exists as its own trait, rather than a method on [`Concrete`], because of where the
+/// `Send + Sync` requirement has to land. Writing it as `fn arc_into_dyn(..) where Self::Complete:
+/// Send + Sync` puts an unsatisfiable bound on a *concrete* type for any class that is not
+/// thread-safe — and Rust rejects those outright rather than just making the method unavailable.
+/// A class holding an `Obj<Node>` child, which is most of a tree, could then not be declared at
+/// all.
+///
+/// Putting the bound on a generic parameter instead makes the impl simply not apply to such a
+/// class, which is what was wanted all along: [`ArcShared`](crate::ArcShared) is unavailable for
+/// it, and everything else still works.
+///
+/// # Safety
+///
+/// The conversion must be a plain unsizing coercion, preserving the object's address and identity.
+pub unsafe trait ArcCoerce<S> {
+    /// Coerces an atomically reference-counted complete object to this interface.
+    fn arc_coerce(value: Arc<S>) -> Arc<Self>;
 }
 
 /// `Self` derives from `B` (or *is* `B`).

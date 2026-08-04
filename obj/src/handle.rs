@@ -16,7 +16,7 @@ use core::hash::{Hash, Hasher};
 use core::ops::{Deref, DerefMut};
 
 use crate::cast::{data_ptr_of, dyn_ptr_of, is_a, rebuild_fat, vtable_of};
-use crate::class::{AnyObj, Class, Concrete, SubclassOf};
+use crate::class::{AnyObj, ArcCoerce, Class, Concrete, SubclassOf};
 use crate::dyn_traits::{CloneObj, DynEq, DynHash, DynTotalEq};
 use crate::meta::{ClassMeta, VTablePtr};
 
@@ -431,9 +431,11 @@ impl<C: Class> ArcShared<C> {
     pub fn new(value: C::Complete) -> Self
     where
         C: Concrete,
-        C::Complete: Send + Sync,
+        C::SendDyn: ArcCoerce<C::Complete>,
     {
-        Self(C::arc_into_dyn(Arc::new(value)))
+        Self(<C::SendDyn as ArcCoerce<C::Complete>>::arc_coerce(
+            Arc::new(value),
+        ))
     }
 
     /// Borrows this object as a polymorphic reference.

@@ -126,6 +126,24 @@ impl Parse for ClassArgs {
     }
 }
 
+/// Emits a failed class as the error plus enough scaffolding to stop the failure cascading.
+///
+/// Without this, one bad `#[obj::class(..)]` produces three errors: its own, then "cannot find
+/// type `Shape`" because the struct was swallowed, then "cannot find macro
+/// `__obj_ancestors_Shape`" from the `#[obj::methods]` block next to it. Keeping the struct and
+/// stubbing the ancestor walk leaves only the error the user can act on.
+pub fn recover(err: syn::Error, item: ItemStruct) -> TokenStream {
+    let mac = ancestors_macro(&item.ident);
+    let err = err.into_compile_error();
+    quote! {
+        #err
+        #item
+        #[doc(hidden)]
+        #[macro_export]
+        macro_rules! #mac { ($($ignored:tt)*) => {}; }
+    }
+}
+
 pub fn expand(args: ClassArgs, mut item: ItemStruct) -> syn::Result<TokenStream> {
     let class = item.ident.clone();
     let vis = item.vis.clone();

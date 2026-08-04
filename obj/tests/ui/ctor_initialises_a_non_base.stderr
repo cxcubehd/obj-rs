@@ -1,0 +1,5 @@
+error: obj: `Square` does not have `Elephant` as a direct base
+  --> tests/ui/ctor_initialises_a_non_base.rs:12:52
+   |
+12 |         ctor new(x: f64, side: f64) : Shape { x }, Elephant { trunk: 1 } { side }
+   |                                                    ^^^^^^^^

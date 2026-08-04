@@ -85,11 +85,15 @@ mod methods;
 /// *below* `#[obj::class]` so it sees the injected base field.
 #[proc_macro_attribute]
 pub fn class(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let args = parse_macro_input!(attr as class::ClassArgs);
     let item = parse_macro_input!(item as syn::ItemStruct);
-    class::expand(args, item)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+    let args = match syn::parse::<class::ClassArgs>(attr) {
+        Ok(args) => args,
+        Err(err) => return class::recover(err, item).into(),
+    };
+    match class::expand(args, item.clone()) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => class::recover(err, item).into(),
+    }
 }
 
 /// Declares the behaviour half of a class.
@@ -113,9 +117,11 @@ pub fn class(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn methods(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as methods::MethodsInput);
-    methods::expand(input)
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
+    let class = input.self_ty.clone();
+    match methods::expand(input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => methods::recover(err, &class).into(),
+    }
 }
 
 /// Declares whole classes in one block, C++-style.

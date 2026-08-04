@@ -66,7 +66,7 @@ pub mod vbase;
 #[doc(hidden)]
 pub mod __private;
 
-pub use class::{AnyObj, Class, Concrete, SubclassOf};
+pub use class::{AnyObj, ArcCoerce, Class, Concrete, SubclassOf};
 pub use dyn_traits::{CloneObj, DynEq, DynHash, DynTotalEq};
 pub use handle::{ArcShared, Obj, Ref, RefMut, Shared, WeakArcShared, WeakShared};
 pub use meta::{BaseEntry, BaseTable, ClassId, ClassMeta, VTablePtr, MAX_BASES};
