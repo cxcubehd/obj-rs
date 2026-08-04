@@ -65,12 +65,20 @@ pub(crate) fn data_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*cons
 /// most-derived type, so the data half must keep addressing the complete object. Applying the
 /// offset here would silently dispatch to `T`'s own implementation instead of the override.
 pub(crate) fn dyn_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*const T::Dyn> {
-    let entry = src.class_meta().find_base(TypeId::of::<T>())?;
-    // `None` only for an abstract class's own table, which a live object never has.
-    let vtable = entry.dyn_vtable?;
+    let vtable = dyn_vtable_of::<T, S>(src)?;
     // SAFETY: `vtable` was captured from this object's most-derived type coerced to `T::Dyn`, and
     // `obj_addr` is that object's address, so the pair is coherent.
     Some(unsafe { rebuild_fat::<T::Dyn>(src.obj_addr(), vtable) })
+}
+
+/// Looks up the vtable that views `src`'s most-derived type as `T`'s interface.
+///
+/// The data half is left to the caller. Owning handles need this: their data pointer has to keep
+/// the *allocation's* provenance, and re-deriving it from the `&src` used for the lookup would
+/// yield a read-only tag that the reconstructed `Box`/`Rc`/`Arc` may not write through.
+pub(crate) fn dyn_vtable_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<VTablePtr> {
+    // `None` only for an abstract class's own table, which a live object never has.
+    src.class_meta().find_base(TypeId::of::<T>())?.dyn_vtable
 }
 
 /// Returns whether `src`'s most-derived class is, or derives from, `T`.

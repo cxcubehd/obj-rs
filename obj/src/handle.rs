@@ -13,7 +13,7 @@ use alloc::rc::{Rc, Weak as RcWeak};
 use alloc::sync::{Arc, Weak as ArcWeak};
 use core::ops::{Deref, DerefMut};
 
-use crate::cast::{data_ptr_of, dyn_ptr_of, is_a};
+use crate::cast::{data_ptr_of, dyn_ptr_of, dyn_vtable_of, is_a, rebuild_fat};
 use crate::class::{Class, Concrete, SubclassOf};
 use crate::meta::ClassMeta;
 
@@ -90,14 +90,18 @@ impl<C: Class> Obj<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<Obj<T>, Self> {
-        let Some(ptr) = dyn_ptr_of::<T, _>(&*self.0) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        // Release ownership *before* rebuilding, so the object is never owned twice.
-        let _ = Box::into_raw(self.0);
-        // SAFETY: `ptr` addresses the very same allocation, and its vtable belongs to the same
-        // most-derived type, so the size/align/drop recovered from it are the ones the allocation
-        // was created with.
+        // Release ownership *before* rebuilding, so the object is never owned twice. The data
+        // address comes from the raw pointer rather than from a `&`, so the rebuilt `Box` inherits
+        // the allocation's own provenance and may write through it (notably when dropping).
+        let data = Box::into_raw(self.0).cast::<u8>();
+        // SAFETY: `data` is the address of the very same object, and `vtable` belongs to its
+        // most-derived type, so the size/align/drop recovered from the pair are the ones the
+        // allocation was created with.
+        let ptr: *const T::Dyn = unsafe { rebuild_fat(data, vtable) };
+        // SAFETY: as above; ownership was released one line earlier and is taken back here.
         Ok(Obj(unsafe { Box::from_raw(ptr.cast_mut()) }))
     }
 }
@@ -343,12 +347,16 @@ impl<C: Class> Shared<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<Shared<T>, Self> {
-        let Some(ptr) = dyn_ptr_of::<T, _>(&*self.0) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        let _ = Rc::into_raw(self.0);
-        // SAFETY: `ptr` addresses the same allocation, and its vtable belongs to the same
-        // most-derived type, so the layout recovered from it is the one the `Rc` was built with.
+        // As in `Obj::downcast`, the data address is taken from the raw pointer so the rebuilt
+        // handle keeps the allocation's provenance.
+        let data = Rc::into_raw(self.0).cast::<u8>();
+        // SAFETY: `data` addresses the same object, and `vtable` belongs to its most-derived type,
+        // so the layout recovered from the pair is the one the `Rc` was built with.
+        let ptr: *const T::Dyn = unsafe { rebuild_fat(data, vtable) };
+        // SAFETY: as above; the strong count released by `into_raw` is reclaimed here.
         Ok(Shared(unsafe { Rc::from_raw(ptr) }))
     }
 }
@@ -444,19 +452,16 @@ impl<C: Class> ArcShared<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<ArcShared<T>, Self> {
-        let meta = crate::class::AnyObj::class_meta(&*self.0);
-        let Some(entry) = meta.find_base(core::any::TypeId::of::<T>()) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        let Some(vtable) = entry.dyn_vtable else {
-            return Err(self);
-        };
-        let data = crate::class::AnyObj::obj_addr(&*self.0);
-        let _ = Arc::into_raw(self.0);
+        // As in `Obj::downcast`, the data address is taken from the raw pointer so the rebuilt
+        // handle keeps the allocation's provenance.
+        let data = Arc::into_raw(self.0).cast::<u8>();
         // SAFETY: the rebuilt pointer addresses the same allocation and its vtable belongs to the
         // same most-derived type, so the layout `Arc::from_raw` recovers is the one the handle was
         // built with. `Send + Sync` carry over because the concrete type is unchanged.
-        let fat: *const T::SendDyn = unsafe { crate::cast::rebuild_fat(data, vtable) };
+        let fat: *const T::SendDyn = unsafe { rebuild_fat(data, vtable) };
         // SAFETY: as above.
         Ok(ArcShared(unsafe { Arc::from_raw(fat) }))
     }

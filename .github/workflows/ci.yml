@@ -22,8 +22,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      - run: cargo test --all-features --workspace
+      # Note the absence of `--all-features`: the `nightly` feature turns on `feature(ptr_metadata)`
+      # and therefore only builds on the nightly channel, where the `nightly` job covers it.
       - run: cargo test --workspace
+      - run: cargo test -p obj --no-default-features
 
   msrv:
     name: minimum supported rust version
@@ -56,10 +58,23 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy -p obj --all-targets --no-default-features
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  nightly:
+    name: nightly feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      # The `ui` tests are skipped: `trybuild` compares against rustc's stable diagnostics.
+      - run: cargo test -p obj --features nightly -- --skip ui
+      - run: cargo clippy -p obj --all-targets --features nightly
 
   miri:
     name: miri
@@ -72,5 +87,10 @@ jobs:
       # Miri is what actually validates the fat-pointer reconstruction, subobject addressing and
       # virtual-base offset arithmetic.
       - run: cargo miri test --workspace -- --skip ui
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+      # The `nightly` feature swaps the transmute in `rebuild_fat` for `ptr::from_raw_parts`, so it
+      # needs its own run to be validated.
+      - run: cargo miri test -p obj --features nightly -- --skip ui
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
