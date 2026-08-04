@@ -1,0 +1,5 @@
+error: obj: `Ord` is not one of the traits `dyn_traits` can carry through a handle; expected one of Debug, Display, Clone, PartialEq, Eq, Hash
+ --> tests/ui/unknown_dyn_trait.rs:2:25
+  |
+2 | #[obj::class(dyn_traits(Ord))]
+  |                         ^^^

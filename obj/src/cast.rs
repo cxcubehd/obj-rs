@@ -51,6 +51,30 @@ pub(crate) unsafe fn rebuild_fat<D: ?Sized>(data: *const u8, vtable: VTablePtr) 
     core::ptr::from_raw_parts(data.cast::<()>(), meta)
 }
 
+/// Reads back the vtable half of an existing fat pointer.
+///
+/// Used when a new allocation is known to hold the *same* most-derived type as an existing handle
+/// — a virtual clone — so the handle's own vtable already describes it and no table lookup is
+/// needed.
+#[cfg(not(feature = "nightly"))]
+pub(crate) fn vtable_of<D: ?Sized>(ptr: *const D) -> VTablePtr {
+    let () = FatCheck::<D>::OK;
+    // SAFETY: `FatCheck` proves `*const D` is two words laid out as (data, vtable), so reading the
+    // second word yields the vtable that the compiler itself installed.
+    let parts: [*const (); 2] = unsafe { core::mem::transmute_copy(&ptr) };
+    VTablePtr(parts[1])
+}
+
+/// Reads back the vtable half of an existing fat pointer.
+#[cfg(feature = "nightly")]
+pub(crate) fn vtable_of<D: ?Sized>(ptr: *const D) -> VTablePtr {
+    let () = FatCheck::<D>::OK;
+    let meta = core::ptr::metadata(ptr);
+    // SAFETY: `D` is a `dyn` trait, so its metadata is a one-word `DynMetadata`, which is what
+    // `VTablePtr` wraps. `rebuild_fat` reverses this transmute symmetrically.
+    VTablePtr(unsafe { core::mem::transmute_copy(&meta) })
+}
+
 /// Locates the `T` *data* subobject inside `src`, applying the recorded byte offset.
 pub(crate) fn data_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*const T> {
     let entry = src.class_meta().find_base(TypeId::of::<T>())?;
@@ -59,15 +83,37 @@ pub(crate) fn data_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*cons
     Some(unsafe { src.obj_addr().add(entry.data_offset).cast::<T>() })
 }
 
+/// Locates the `T` *data* subobject inside `src`, for writing.
+///
+/// Not just `data_ptr_of(..).cast_mut()`: a pointer derived from a shared reference carries
+/// read-only provenance, so writing through it is undefined behaviour even though the caller holds
+/// a unique borrow. The address still comes from [`AnyObj::obj_addr`], but the provenance is taken
+/// from the unique borrow itself.
+pub(crate) fn data_ptr_of_mut<T: Class, S: AnyObj + ?Sized>(src: &mut S) -> Option<*mut T> {
+    let entry = src.class_meta().find_base(TypeId::of::<T>())?;
+    let addr = src.obj_addr().addr();
+    let base: *mut u8 = (src as *mut S).cast();
+    // SAFETY: `addr` is the start of the very object `base` points at, so `with_addr` keeps the
+    // pointer inside its own allocation; `entry` came from that object's own metadata, so
+    // `data_offset` lands in bounds on its `T` subobject.
+    Some(unsafe { base.with_addr(addr).add(entry.data_offset).cast::<T>() })
+}
+
+/// Looks up the vtable that views `src`'s most-derived class through `T`'s interface.
+///
+/// `None` if `src` does not derive from `T`, or — only for an abstract class's own table, which a
+/// live object never has — if the entry records no vtable.
+pub(crate) fn dyn_vtable_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<VTablePtr> {
+    src.class_meta().find_base(TypeId::of::<T>())?.dyn_vtable
+}
+
 /// Builds a *polymorphic* pointer to `src` viewed as `T`'s interface.
 ///
 /// Note the deliberate absence of `data_offset`: Rust implements a `dyn` trait for the
 /// most-derived type, so the data half must keep addressing the complete object. Applying the
 /// offset here would silently dispatch to `T`'s own implementation instead of the override.
 pub(crate) fn dyn_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*const T::Dyn> {
-    let entry = src.class_meta().find_base(TypeId::of::<T>())?;
-    // `None` only for an abstract class's own table, which a live object never has.
-    let vtable = entry.dyn_vtable?;
+    let vtable = dyn_vtable_of::<T, S>(src)?;
     // SAFETY: `vtable` was captured from this object's most-derived type coerced to `T::Dyn`, and
     // `obj_addr` is that object's address, so the pair is coherent.
     Some(unsafe { rebuild_fat::<T::Dyn>(src.obj_addr(), vtable) })
@@ -89,6 +135,9 @@ pub(crate) fn is_a<T: Class, S: AnyObj + ?Sized>(src: &S) -> bool {
 /// If `src` does not derive from `T`. Generated code only ever calls this where the interface
 /// itself proves the relationship, so this cannot fire from safe user code.
 pub fn subobject<T: Class, S: AnyObj + ?Sized>(src: &S) -> &T {
+    if src.class_meta().shares_bases {
+        expose_complete(src.obj_addr());
+    }
     let ptr = data_ptr_of::<T, S>(src).unwrap_or_else(|| {
         panic!(
             "obj: `{}` does not derive from `{}`",
@@ -101,19 +150,42 @@ pub fn subobject<T: Class, S: AnyObj + ?Sized>(src: &S) -> &T {
     unsafe { &*ptr }
 }
 
+/// Publishes the complete object's provenance before a reference to one of its subobjects is
+/// handed out.
+///
+/// A `&Subobject` carries permission for that subobject alone. That is exactly right for field
+/// access, but a **virtual base** is a *sibling* — it lives elsewhere in the complete object — so
+/// resolving one from a subobject reference would step outside what the borrow grants. Exposing
+/// the enclosing object here is what leaves a suitable tag reachable for
+/// [`VBase::resolve`](crate::VBase::resolve) to find afterwards.
+///
+/// This costs nothing at runtime; it only tells the compiler this allocation may be reached by
+/// address, and it is why `obj` cannot be checked under `-Zmiri-strict-provenance`.
+#[inline]
+fn expose_complete(addr: *const u8) {
+    let _ = addr.expose_provenance();
+}
+
 /// Mutably borrows the `T` subobject of an object known to derive from `T`.
 ///
 /// # Panics
 ///
 /// See [`subobject`].
 pub fn subobject_mut<T: Class, S: AnyObj + ?Sized>(src: &mut S) -> &mut T {
-    let ptr = data_ptr_of::<T, S>(src).unwrap_or_else(|| {
+    // Exposed from the *unique* borrow, so that resolving a virtual base through the returned
+    // reference may also write to it. See `expose_complete`.
+    if src.class_meta().shares_bases {
+        let _ = core::ptr::from_mut(src).cast::<u8>().expose_provenance();
+    }
+    let found = data_ptr_of_mut::<T, S>(src);
+    let ptr = found.unwrap_or_else(|| {
         panic!(
             "obj: `{}` does not derive from `{}`",
             src.class_meta().name,
             T::META.name,
         )
     });
-    // SAFETY: as `subobject`, and `src` is borrowed uniquely for the returned lifetime.
-    unsafe { &mut *ptr.cast_mut() }
+    // SAFETY: as `subobject`, and `data_ptr_of_mut` carried the unique borrow's provenance
+    // through, so `src`'s uniqueness backs the returned reference for its whole lifetime.
+    unsafe { &mut *ptr }
 }

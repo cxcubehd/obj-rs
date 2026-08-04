@@ -1,0 +1,7 @@
+error: obj: `Doc` is inherited both virtually and directly within `Xhtml`'s hierarchy; make every path to it `virtual`, or none of them
+  --> tests/ui/mixed_virtual_and_direct_base.rs:20:28
+   |
+20 | #[obj::class(extends(Html, Doc))]
+   |                            ^^^
+   |
+   = note: this error originates in the macro `__obj_ancestors_Xhtml` which comes from the expansion of the attribute macro `obj::class` (in Nightly builds, run with -Z macro-backtrace for more info)

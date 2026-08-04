@@ -1,0 +1,5 @@
+error: obj: `dyn_traits(Eq)` also needs `PartialEq`, since `Eq` only marks an existing `PartialEq` as total
+ --> tests/ui/eq_without_partial_eq.rs:2:25
+  |
+2 | #[obj::class(dyn_traits(Eq))]
+  |                         ^^

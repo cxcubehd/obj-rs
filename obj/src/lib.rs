@@ -18,6 +18,7 @@
 //! | `dynamic_cast` | [`ClassMeta`] base table, reached by one virtual call | ~a call |
 //! | Abstract class | [`Concrete`] simply not implemented | compile-time |
 //! | Virtual destructor | `Box<dyn _>` drop glue | free |
+//! | Virtual base class | [`VBase`] link into the complete object | a byte offset |
 //!
 //! Objects carry **no per-object overhead**: the vtable rides in the handle, exactly as it does
 //! for `&dyn Trait`.
@@ -35,12 +36,48 @@
 //! Crucially, the reverse requires a complete object, which is what makes C++ slicing
 //! unrepresentable here.
 //!
+//! # Two spellings
+//!
+//! [`#[obj::class]`](macro@class) and [`#[obj::methods]`](macro@methods) are the implementation.
+//! [`obj::classes!`](macro@classes) is sugar over exactly those attributes — never a second
+//! implementation — and gives back `virtual`, `override` and `abstract` as keywords, a base list
+//! after `:`, and constructors with a base-initializer list.
+//!
+//! # What each piece does
+//!
+//! - [`Obj`], [`Shared`], [`ArcShared`], [`Ref`], [`RefMut`] — the handles, and the only things
+//!   through which methods dispatch virtually.
+//! - [`class`](mod@class) — what it means to be a class: [`Class`], [`Concrete`], [`SubclassOf`],
+//!   [`AnyObj`].
+//! - [`meta`] — the runtime class metadata a `dynamic_cast` consults.
+//! - [`vbase`] — virtual (shared) base classes, and the [`VBase`] link that reaches one.
+//! - [`dyn_traits`] — `Debug`, `Display`, `Clone`, `PartialEq`, `Eq` and `Hash` through a handle.
+//!
+//! Three runnable examples ship with the crate: `shapes` covers every feature end to end, `ast`
+//! builds an expression tree with the DSL, and `diamond` shows a shared base reached two ways.
+//!
 //! # Safety
 //!
-//! Generated code is safe; the `unsafe` lives in this crate and has three sources, all documented
-//! at their definitions: prefix-layout subobject addressing (guarded by `#[repr(C)]` and generated
-//! `offset_of!` assertions), fat-pointer reconstruction for sidecasts, and virtual-base offset
-//! arithmetic.
+//! The `unsafe` lives in this crate and has three sources, all documented at their definitions:
+//! prefix-layout subobject addressing (guarded by `#[repr(C)]` and generated `offset_of!`
+//! assertions), fat-pointer reconstruction for sidecasts, and virtual-base offset arithmetic.
+//!
+//! Generated code contains exactly one `unsafe` block, in the `complete(..)` constructor of a
+//! class with virtual bases, where two `offset_of!` constants are subtracted to form a
+//! [`VBase`] link.
+//!
+//! All of it is covered by Miri. Hierarchies without virtual bases are checked under
+//! `-Zmiri-strict-provenance`; virtual bases cannot be, because reaching a shared base means
+//! addressing a *sibling* of the subobject you hold and a reference grants permission for its own
+//! subobject only. Those are checked under Tree Borrows instead — see [`VBase::resolve`].
+//!
+//! # Features
+//!
+//! - `std` (default) — reserved for `std`-only conveniences; the crate is `no_std + alloc`
+//!   without it.
+//! - `nightly` — rebuilds fat pointers with `core::ptr::from_raw_parts` rather than a transmute.
+//!   **Nightly-only**: it enables `#![feature(ptr_metadata)]`, so `--all-features` does not build
+//!   on stable or beta.
 
 #![no_std]
 #![cfg_attr(feature = "nightly", feature(ptr_metadata))]
@@ -49,18 +86,22 @@ extern crate alloc;
 
 pub mod cast;
 pub mod class;
+pub mod dyn_traits;
 mod handle;
 pub mod meta;
+pub mod vbase;
 
 #[doc(hidden)]
 pub mod __private;
 
-pub use class::{AnyObj, Class, Concrete, SubclassOf};
+pub use class::{AnyObj, ArcCoerce, Class, Concrete, SubclassOf};
+pub use dyn_traits::{CloneObj, DynEq, DynHash, DynTotalEq};
 pub use handle::{ArcShared, Obj, Ref, RefMut, Shared, WeakArcShared, WeakShared};
 pub use meta::{BaseEntry, BaseTable, ClassId, ClassMeta, VTablePtr, MAX_BASES};
 #[doc(hidden)]
 pub use obj_macros::__obj_emit;
-pub use obj_macros::{class, methods};
+pub use obj_macros::{class, classes, methods};
+pub use vbase::VBase;
 
 /// Captures the vtable produced by coercing a concrete type to a `dyn` interface.
 ///

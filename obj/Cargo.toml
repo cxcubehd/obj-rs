@@ -18,10 +18,19 @@ default = ["std"]
 # Enables `std`-only conveniences. The crate is `no_std + alloc` without it.
 std = []
 # Uses `core::ptr::from_raw_parts` instead of a transmute to rebuild fat pointers.
+#
+# Requires the nightly channel: it turns on `#![feature(ptr_metadata)]`. Enabling it on stable or
+# beta fails with E0554, so `--all-features` only works on nightly.
 nightly = []
 
 [dev-dependencies]
 trybuild = "1.0"
+
+# Timed directly rather than through a benchmark framework, so `cargo bench` needs no extra
+# dependencies and CI does not pay to compile one.
+[[bench]]
+name = "dispatch"
+harness = false
 
 [lints]
 workspace = true

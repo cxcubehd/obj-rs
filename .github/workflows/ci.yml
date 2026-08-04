@@ -16,14 +16,33 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: [stable, beta]
+        include:
+          # The trybuild UI snapshots record one compiler's exact diagnostic wording, so they run
+          # on stable alone. Beta carries the *next* stable's wording, so letting it check them
+          # turns every upstream diagnostic reword into a red build here, six weeks early.
+          - rust: stable
+            ui: ""
+          - rust: beta
+            ui: "-- --skip ui"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      - run: cargo test --all-features --workspace
-      - run: cargo test --workspace
+      # Not `--all-features`: the `nightly` feature turns on `#![feature(ptr_metadata)]`, which is
+      # rejected outright on these channels. The `nightly` job below covers it instead.
+      - run: cargo test --workspace ${{ matrix.ui }}
+      - run: cargo test --workspace --no-default-features ${{ matrix.ui }}
+
+  nightly:
+    name: nightly feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      # `--skip ui`: trybuild compares against stable's exact diagnostics, so the UI tests belong
+      # to the `test` job. Everything else exercises the `from_raw_parts` fat-pointer path.
+      - run: cargo test --workspace --all-features -- --skip ui
 
   msrv:
     name: minimum supported rust version
@@ -56,7 +75,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features
+      # `--all-features` would pull in the nightly-only feature; see the `test` job.
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --no-default-features
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -71,6 +92,32 @@ jobs:
           components: miri
       # Miri is what actually validates the fat-pointer reconstruction, subobject addressing and
       # virtual-base offset arithmetic.
-      - run: cargo miri test --workspace -- --skip ui
+      #
+      # Two runs, because virtual bases are the one feature that cannot be checked under strict
+      # provenance. Reaching a shared base means addressing a *sibling* of the subobject you hold,
+      # and a reference grants permission for its own subobject only; `obj` therefore exposes the
+      # complete object's provenance for those hierarchies, which strict provenance forbids by
+      # construction. Everything else stays under the stricter model.
+      - name: stacked borrows, strict provenance
+        run: >
+          cargo miri test -p obj
+          --test golden
+          --test single_inheritance
+          --test multiple_inheritance
+          --test shared_handles
+          --test std_traits
+          --test dsl
+          --test non_send_class
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
+      # Tree borrows covers everything, virtual bases included, and is the model that can.
+      - name: tree borrows, whole workspace
+        run: cargo miri test --workspace -- --skip ui
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+      # The `nightly` feature rebuilds fat pointers a different way, so it is a distinct unsafe
+      # path and needs its own run.
+      - name: tree borrows, nightly fat-pointer path
+        run: cargo miri test --workspace --all-features -- --skip ui
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows

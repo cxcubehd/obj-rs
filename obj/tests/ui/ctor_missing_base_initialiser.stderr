@@ -1,0 +1,5 @@
+error: obj: constructor `new` does not initialise the `Drawable` base of `Circle`; add `Drawable(..)` to its initialiser list
+  --> tests/ui/ctor_missing_base_initialiser.rs:17:14
+   |
+17 |         ctor new(x: f64, r: f64) : Shape { x } { r }
+   |              ^^^

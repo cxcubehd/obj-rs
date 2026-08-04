@@ -1,0 +1,5 @@
+error: obj: `Html` is abstract, so it is never the most-derived class and must not initialise virtual bases; leave that to the concrete class below it
+  --> tests/ui/abstract_class_initialises_virtual_base.rs:12:14
+   |
+12 |         ctor new(id: u32, tag: u8) : virtual Doc { id } { tag }
+   |              ^^^

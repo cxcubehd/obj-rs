@@ -11,11 +11,34 @@
 use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak as RcWeak};
 use alloc::sync::{Arc, Weak as ArcWeak};
+use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::ops::{Deref, DerefMut};
 
-use crate::cast::{data_ptr_of, dyn_ptr_of, is_a};
-use crate::class::{Class, Concrete, SubclassOf};
+use crate::cast::{
+    data_ptr_of, data_ptr_of_mut, dyn_ptr_of, dyn_vtable_of, is_a, rebuild_fat, vtable_of,
+};
+use crate::class::{ArcCoerce, Class, Concrete, SubclassOf};
+use crate::dyn_traits::{CloneObj, DynEq, DynHash, DynTotalEq};
 use crate::meta::ClassMeta;
+
+/// Deep-copies the object behind a polymorphic reference, preserving its most-derived class.
+///
+/// No base-table lookup is needed: [`CloneObj`] promises the copy has the same most-derived type
+/// as `src`, so `src`'s own vtable already describes it.
+fn clone_dyn<C: Class>(src: &C::Dyn) -> Box<C::Dyn>
+where
+    C::Dyn: CloneObj,
+{
+    let vtable = vtable_of(core::ptr::from_ref(src));
+    let raw = src.clone_raw();
+    // SAFETY: `CloneObj` guarantees `raw` came from `Box::into_raw` on a fresh object of the same
+    // most-derived type as `src`, so pairing it with `src`'s vtable is coherent, and the size,
+    // alignment and drop glue that `Box` recovers are the ones the allocation was made with.
+    let fat = unsafe { rebuild_fat::<C::Dyn>(raw.cast_const(), vtable) };
+    // SAFETY: as above. `clone_raw` handed over ownership of the allocation.
+    unsafe { Box::from_raw(fat.cast_mut()) }
+}
 
 /// An owning polymorphic handle — the `obj` analogue of C++'s `unique_ptr<C>`.
 ///
@@ -90,11 +113,17 @@ impl<C: Class> Obj<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<Obj<T>, Self> {
-        let Some(ptr) = dyn_ptr_of::<T, _>(&*self.0) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        // Release ownership *before* rebuilding, so the object is never owned twice.
-        let _ = Box::into_raw(self.0);
+        // Release ownership *before* rebuilding, so the object is never owned twice — and rebuild
+        // from the raw pointer rather than from `obj_addr`, so the result inherits the
+        // allocation's own provenance instead of that of the shared borrow used for the lookup.
+        let raw: *mut C::Dyn = Box::into_raw(self.0);
+        // SAFETY: the data half of `raw` is the address of the complete object, which is what a
+        // polymorphic pointer must carry, and `vtable` was captured from that same most-derived
+        // type coerced to `T::Dyn`, so the pair is coherent.
+        let ptr: *const T::Dyn = unsafe { rebuild_fat(raw.cast::<u8>(), vtable) };
         // SAFETY: `ptr` addresses the very same allocation, and its vtable belongs to the same
         // most-derived type, so the size/align/drop recovered from it are the ones the allocation
         // was created with.
@@ -263,10 +292,10 @@ impl<'a, C: Class> RefMut<'a, C> {
     /// Mutably casts to the *data* view of another class in this object's hierarchy.
     #[must_use]
     pub fn cast_mut<T: Class>(self) -> Option<&'a mut T> {
-        // SAFETY: `data_ptr_of` returns an in-bounds pointer to the `T` subobject; `self` holds
-        // the unique borrow for `'a`, so handing out a unique reference to a subobject of it is
-        // sound.
-        data_ptr_of::<T, _>(self.0).map(|p| unsafe { &mut *p.cast_mut() })
+        // SAFETY: `data_ptr_of_mut` returns an in-bounds, writable pointer to the `T` subobject;
+        // `self` holds the unique borrow for `'a`, so handing out a unique reference to a
+        // subobject of it is sound.
+        data_ptr_of_mut::<T, _>(self.0).map(|p| unsafe { &mut *p })
     }
 }
 
@@ -343,12 +372,20 @@ impl<C: Class> Shared<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<Shared<T>, Self> {
-        let Some(ptr) = dyn_ptr_of::<T, _>(&*self.0) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        let _ = Rc::into_raw(self.0);
+        // As in `Obj::downcast`: rebuild from the pointer that owns the allocation, so the result
+        // does not inherit the read-only provenance of the borrow used for the lookup. `from_raw`
+        // needs to reach the reference counts that sit *before* the value, which a pointer derived
+        // from `&*self.0` has no provenance over.
+        let raw: *const C::Dyn = Rc::into_raw(self.0);
+        // SAFETY: the data half of `raw` addresses the complete object, and `vtable` was captured
+        // from that same most-derived type coerced to `T::Dyn`.
+        let ptr: *const T::Dyn = unsafe { rebuild_fat(raw.cast::<u8>(), vtable) };
         // SAFETY: `ptr` addresses the same allocation, and its vtable belongs to the same
-        // most-derived type, so the layout recovered from it is the one the `Rc` was built with.
+        // most-derived type, so the layout recovered from it is the one the `Rc` was built with,
+        // and the strong count was transferred rather than duplicated.
         Ok(Shared(unsafe { Rc::from_raw(ptr) }))
     }
 }
@@ -394,9 +431,11 @@ impl<C: Class> ArcShared<C> {
     pub fn new(value: C::Complete) -> Self
     where
         C: Concrete,
-        C::Complete: Send + Sync,
+        C::SendDyn: ArcCoerce<C::Complete>,
     {
-        Self(C::arc_into_dyn(Arc::new(value)))
+        Self(<C::SendDyn as ArcCoerce<C::Complete>>::arc_coerce(
+            Arc::new(value),
+        ))
     }
 
     /// Borrows this object as a polymorphic reference.
@@ -444,19 +483,17 @@ impl<C: Class> ArcShared<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<ArcShared<T>, Self> {
-        let meta = crate::class::AnyObj::class_meta(&*self.0);
-        let Some(entry) = meta.find_base(core::any::TypeId::of::<T>()) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        let Some(vtable) = entry.dyn_vtable else {
-            return Err(self);
-        };
-        let data = crate::class::AnyObj::obj_addr(&*self.0);
-        let _ = Arc::into_raw(self.0);
+        // As in `Shared::downcast`: the address has to come from the pointer that owns the
+        // allocation, not from a borrow of the value, because `from_raw` walks back to the
+        // reference counts stored ahead of it.
+        let raw: *const C::SendDyn = Arc::into_raw(self.0);
         // SAFETY: the rebuilt pointer addresses the same allocation and its vtable belongs to the
         // same most-derived type, so the layout `Arc::from_raw` recovers is the one the handle was
         // built with. `Send + Sync` carry over because the concrete type is unchanged.
-        let fat: *const T::SendDyn = unsafe { crate::cast::rebuild_fat(data, vtable) };
+        let fat: *const T::SendDyn = unsafe { rebuild_fat(raw.cast::<u8>(), vtable) };
         // SAFETY: as above.
         Ok(ArcShared(unsafe { Arc::from_raw(fat) }))
     }
@@ -491,4 +528,145 @@ impl<C: Class> Clone for WeakArcShared<C> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
+}
+
+// ------------------------------------------------------------------ virtual clone
+
+impl<C: Class> Clone for Obj<C>
+where
+    C::Dyn: CloneObj,
+{
+    /// Deep-copies the object, preserving its most-derived class.
+    ///
+    /// Cloning an `Obj<Shape>` that holds a `Circle` yields an `Obj<Shape>` holding a `Circle` —
+    /// the C++ "virtual clone" idiom. Available once the class opts in with
+    /// `#[obj::class(dyn_traits(Clone))]`.
+    fn clone(&self) -> Self {
+        Obj(clone_dyn::<C>(&self.0))
+    }
+}
+
+impl<C: Class> Ref<'_, C> {
+    /// Deep-copies the referent into an owned handle, preserving its most-derived class.
+    #[must_use]
+    pub fn clone_obj(self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(self.0))
+    }
+}
+
+impl<C: Class> RefMut<'_, C> {
+    /// Deep-copies the referent into an owned handle, preserving its most-derived class.
+    #[must_use]
+    pub fn clone_obj(&self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(self.0))
+    }
+}
+
+impl<C: Class> Shared<C> {
+    /// Deep-copies the object into a new, unshared handle.
+    ///
+    /// [`Clone`](Self::clone) shares the existing object by bumping its refcount; this copies it.
+    #[must_use]
+    pub fn clone_obj(&self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(&self.0))
+    }
+}
+
+impl<C: Class> ArcShared<C> {
+    /// Deep-copies the object into a new, unshared handle.
+    ///
+    /// [`Clone`](Self::clone) shares the existing object by bumping its refcount; this copies it.
+    #[must_use]
+    pub fn clone_obj(&self) -> Obj<C>
+    where
+        C::Dyn: CloneObj,
+    {
+        Obj(clone_dyn::<C>(C::send_as_dyn(&self.0)))
+    }
+}
+
+// ------------------------------------------------------- formatting, equality and hashing
+//
+// Each handle forwards to its referent, so the impls are available exactly when the class opted
+// into the corresponding `dyn_traits(..)` entry.
+
+/// Forwards `Debug` and `Display` from a handle to the object behind it.
+macro_rules! forward_fmt {
+    ($($name:ident $(<$lt:lifetime>)?, $target:ident, |$s:ident| $get:expr;)*) => {$(
+        impl<$($lt,)? C: Class> fmt::Debug for $name<$($lt,)? C>
+        where
+            C::$target: fmt::Debug,
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let $s = self;
+                fmt::Debug::fmt($get, f)
+            }
+        }
+
+        impl<$($lt,)? C: Class> fmt::Display for $name<$($lt,)? C>
+        where
+            C::$target: fmt::Display,
+        {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let $s = self;
+                fmt::Display::fmt($get, f)
+            }
+        }
+    )*};
+}
+
+forward_fmt! {
+    Obj, Dyn, |s| &*s.0;
+    Ref<'a>, Dyn, |s| s.0;
+    RefMut<'a>, Dyn, |s| &*s.0;
+    Shared, Dyn, |s| &*s.0;
+    ArcShared, SendDyn, |s| &*s.0;
+}
+
+/// Forwards `PartialEq`, `Eq` and `Hash` from a handle to the object behind it.
+///
+/// Equality is heterogeneous — objects of different most-derived classes are never equal — and the
+/// class identity is folded into the hash to match, so the two stay consistent.
+macro_rules! forward_cmp {
+    ($($name:ident $(<$lt:lifetime>)?, $target:ident, |$s:ident| $get:expr;)*) => {$(
+        impl<$($lt,)? C: Class> PartialEq for $name<$($lt,)? C>
+        where
+            C::$target: DynEq,
+        {
+            fn eq(&self, other: &Self) -> bool {
+                let ($s, o) = (self, other);
+                let this: &C::$target = $get;
+                let $s = o;
+                this.dyn_eq($get.as_any())
+            }
+        }
+
+        impl<$($lt,)? C: Class> Eq for $name<$($lt,)? C> where C::$target: DynTotalEq {}
+
+        impl<$($lt,)? C: Class> Hash for $name<$($lt,)? C>
+        where
+            C::$target: DynHash,
+        {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                let $s = self;
+                $get.dyn_hash(state);
+            }
+        }
+    )*};
+}
+
+forward_cmp! {
+    Obj, Dyn, |s| &*s.0;
+    Ref<'a>, Dyn, |s| s.0;
+    Shared, Dyn, |s| &*s.0;
+    ArcShared, SendDyn, |s| &*s.0;
 }

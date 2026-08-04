@@ -231,10 +231,125 @@ fn mutation_through_a_secondary_base_handle() {
     assert!((c.x - 3.0).abs() < EPS, "Shape::scale ran");
 }
 
+/// Writing a field through a handle goes through the generated `DerefMut`, which resolves the
+/// base's offset at runtime. Worth its own test under Miri: the pointer it hands back has to carry
+/// write provenance from the unique borrow, not read provenance from the metadata lookup.
+#[test]
+fn field_writes_through_a_handle_land_in_the_right_subobject() {
+    let mut c = Obj::<Circle>::new(Circle::make(1.0, 2.0, "c"));
+
+    // The primary base sits at offset 0...
+    c.x = 5.0;
+    assert!((c.x - 5.0).abs() < EPS, "wrote Shape::x");
+
+    // ...a secondary base does not, so this one also exercises the offset arithmetic.
+    let mut drawable: Obj<Drawable> = c.upcast();
+    drawable.visible = false;
+    assert!(!drawable.visible, "wrote Drawable::visible");
+
+    // The write landed in the one complete object, leaving its other subobjects alone.
+    let circle = drawable.borrow().cast::<Circle>().expect("is a Circle");
+    assert!((circle.r - 2.0).abs() < EPS, "Circle::r untouched");
+    assert!((drawable.borrow().cast::<Shape>().expect("is a Shape").x - 5.0).abs() < EPS);
+}
+
+#[test]
+fn mutable_cast_reaches_a_secondary_base_subobject() {
+    let mut c = Obj::<Circle>::new(Circle::make(1.0, 2.0, "c"));
+
+    let drawable: &mut Drawable = c
+        .borrow_mut()
+        .cast_mut::<Drawable>()
+        .expect("is a Drawable");
+    drawable.visible = false;
+
+    assert!(!c.as_drawable().visible, "mutation is visible through `c`");
+    assert!((c.r - 2.0).abs() < EPS, "and nothing else moved");
+}
+
 #[test]
 fn downcast_from_a_secondary_base_to_the_concrete_class() {
     let drawable: Obj<Drawable> = Obj::<Circle>::new(Circle::make(1.0, 2.0, "c")).upcast();
     let circle: &Circle = drawable.borrow().cast::<Circle>().expect("is a Circle");
     assert!((circle.r - 2.0).abs() < EPS);
     assert!(drawable.is::<Shape>(), "and it is a Shape too");
+}
+
+// ---------------------------------------------------------------- abstract intermediates
+//
+// Delegation has to reach an implementation through classes that provide none of their own. An
+// abstract class implements no interface, so there is no `<Base as ShapeDyn>` to hand the call
+// to, and method lookup only ever walks the *primary* base chain — so a virtual inherited from an
+// abstract intermediate's *secondary* base is the case that needs the delegation path to cross
+// the branch explicitly.
+
+#[obj::class(abstract)]
+pub struct Audible {
+    pub volume: u8,
+}
+
+#[obj::methods]
+impl Audible {
+    /// Declared on what will be a *secondary* base of an abstract intermediate.
+    #[obj(virtual)]
+    fn play(&self) -> String {
+        format!("beep at {}", self.volume)
+    }
+}
+
+/// Abstract, and overrides neither `area` (from its primary base) nor `play` (from its secondary).
+#[obj::class(extends(Shape, Audible), abstract)]
+pub struct Widget {
+    pub id: u32,
+}
+
+#[obj::methods]
+impl Widget {}
+
+#[obj::class(extends = Widget)]
+pub struct Button {
+    pub label: &'static str,
+}
+
+#[obj::methods]
+impl Button {
+    #[obj(override)]
+    fn area(&self) -> f64 {
+        7.0
+    }
+}
+
+fn button() -> Button {
+    Button {
+        widget: Widget {
+            shape: Shape { x: 1.0 },
+            audible: Audible { volume: 3 },
+            id: 9,
+        },
+        label: "ok",
+    }
+}
+
+#[test]
+fn a_virtual_inherited_through_an_abstract_intermediate() {
+    let b = Obj::<Button>::new(button());
+
+    // `Shape::scale` has a body and nobody below overrides it: reached through abstract `Widget`.
+    let mut b = b;
+    b.scale(2.0);
+    assert!((b.x - 2.0).abs() < EPS, "primary chain");
+
+    // `Audible::play` likewise, but it arrives through `Widget`'s *secondary* base.
+    assert_eq!(b.play(), "beep at 3", "secondary branch");
+    assert!((b.area() - 7.0).abs() < EPS, "Button's own override");
+}
+
+#[test]
+fn dispatch_through_a_base_handle_across_an_abstract_intermediate() {
+    let audible: Obj<Audible> = Obj::<Button>::new(button()).upcast();
+    assert_eq!(audible.play(), "beep at 3");
+    assert_eq!(audible.class().name, "Button");
+
+    let shape: Obj<Shape> = Obj::<Button>::new(button()).upcast();
+    assert!((shape.area() - 7.0).abs() < EPS);
 }

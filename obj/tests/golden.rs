@@ -20,7 +20,7 @@ use core::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use obj::{AnyObj, BaseEntry, Class, ClassMeta, Concrete, Obj, Ref, SubclassOf};
+use obj::{AnyObj, ArcCoerce, BaseEntry, Class, ClassMeta, Concrete, Obj, Ref, SubclassOf};
 
 // =====================================================================================
 // class Shape { x: f64; virtual area() = 0; virtual scale(k); fn describe(); }
@@ -86,6 +86,8 @@ unsafe impl Class for Shape {
             data_offset: 0,
             dyn_vtable: None,
         }],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(
@@ -167,6 +169,8 @@ unsafe impl Class for Drawable {
             data_offset: 0,
             dyn_vtable: None,
         }],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(
@@ -320,6 +324,8 @@ unsafe impl Class for Circle {
                 dyn_vtable: Some(obj::__vtable_of!(Circle as dyn DrawableDyn)),
             },
         ],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(
@@ -342,10 +348,15 @@ unsafe impl Concrete for Circle {
     fn rc_into_dyn(value: Rc<Circle>) -> Rc<dyn CircleDyn> {
         value
     }
-    fn arc_into_dyn(value: Arc<Circle>) -> Arc<dyn CircleDyn + Send + Sync>
-    where
-        Circle: Send + Sync,
-    {
+}
+
+// Generic on purpose: the `Send + Sync` bound rides on `S`, so a class that is not thread-safe
+// simply does not get this impl rather than failing to compile. See `ArcCoerce`.
+unsafe impl<S> ArcCoerce<S> for dyn CircleDyn + Send + Sync
+where
+    S: CircleDyn + Send + Sync + Sized + 'static,
+{
+    fn arc_coerce(value: Arc<S>) -> Arc<dyn CircleDyn + Send + Sync> {
         value
     }
 }
@@ -519,6 +530,8 @@ unsafe impl Class for Square {
                 dyn_vtable: Some(obj::__vtable_of!(Square as dyn ShapeDyn)),
             },
         ],
+        // This reference hierarchy uses no virtual inheritance.
+        shares_bases: false,
     };
 
     fn send_as_dyn<'a>(
@@ -541,10 +554,15 @@ unsafe impl Concrete for Square {
     fn rc_into_dyn(value: Rc<Square>) -> Rc<dyn SquareDyn> {
         value
     }
-    fn arc_into_dyn(value: Arc<Square>) -> Arc<dyn SquareDyn + Send + Sync>
-    where
-        Square: Send + Sync,
-    {
+}
+
+// Generic on purpose: the `Send + Sync` bound rides on `S`, so a class that is not thread-safe
+// simply does not get this impl rather than failing to compile. See `ArcCoerce`.
+unsafe impl<S> ArcCoerce<S> for dyn SquareDyn + Send + Sync
+where
+    S: SquareDyn + Send + Sync + Sized + 'static,
+{
+    fn arc_coerce(value: Arc<S>) -> Arc<dyn SquareDyn + Send + Sync> {
         value
     }
 }
@@ -664,18 +682,25 @@ fn sidecast_across_multiple_inheritance_keeps_polymorphism() {
 #[test]
 fn owning_downcast_returns_the_handle_on_failure() {
     let s: Obj<Shape> = Obj::<Square>::new(Square::new(1.0, 2.0)).upcast();
-    let s = s.downcast::<Circle>().err().expect("not a Circle");
+    // `Obj` is only `Debug` when the class opts in, so unwrap by pattern rather than `expect`.
+    let Err(s) = s.downcast::<Circle>() else {
+        panic!("a Square is not a Circle")
+    };
     // the original handle survived intact
     assert_eq!(s.class().name, "Square");
 
-    let sq: Obj<Square> = s.downcast::<Square>().ok().expect("is a Square");
+    let Ok(sq) = s.downcast::<Square>() else {
+        panic!("is a Square")
+    };
     assert!((sq.s - 2.0).abs() < EPS);
 }
 
 #[test]
 fn owning_downcast_preserves_the_allocation() {
     let s: Obj<Shape> = Obj::<Circle>::new(Circle::new(1.0, 2.0)).upcast();
-    let c: Obj<Circle> = s.downcast::<Circle>().ok().expect("is a Circle");
+    let Ok(c) = s.downcast::<Circle>() else {
+        panic!("is a Circle")
+    };
     assert!((c.r - 2.0).abs() < EPS);
     // dropping `c` must free with Circle's layout, recovered from the rebuilt vtable
     drop(c);
