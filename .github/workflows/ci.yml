@@ -22,8 +22,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      - run: cargo test --all-features --workspace
+      # Not `--all-features`: the `nightly` feature turns on `#![feature(ptr_metadata)]`, which is
+      # rejected outright on these channels. The `nightly` job below covers it instead.
       - run: cargo test --workspace
+      - run: cargo test --workspace --no-default-features
+
+  nightly:
+    name: nightly feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      # `--skip ui`: trybuild compares against stable's exact diagnostics, so the UI tests belong
+      # to the `test` job. Everything else exercises the `from_raw_parts` fat-pointer path.
+      - run: cargo test --workspace --all-features -- --skip ui
 
   msrv:
     name: minimum supported rust version
@@ -56,7 +68,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features
+      # `--all-features` would pull in the nightly-only feature; see the `test` job.
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --no-default-features
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -72,5 +86,10 @@ jobs:
       # Miri is what actually validates the fat-pointer reconstruction, subobject addressing and
       # virtual-base offset arithmetic.
       - run: cargo miri test --workspace -- --skip ui
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+      # The `nightly` feature rebuilds fat pointers a different way, so it is a distinct unsafe
+      # path and needs its own run.
+      - run: cargo miri test --workspace --all-features -- --skip ui
         env:
           MIRIFLAGS: -Zmiri-strict-provenance

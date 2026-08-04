@@ -59,15 +59,37 @@ pub(crate) fn data_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*cons
     Some(unsafe { src.obj_addr().add(entry.data_offset).cast::<T>() })
 }
 
+/// Locates the `T` *data* subobject inside `src`, for writing.
+///
+/// Not just `data_ptr_of(..).cast_mut()`: a pointer derived from a shared reference carries
+/// read-only provenance, so writing through it is undefined behaviour even though the caller holds
+/// a unique borrow. The address still comes from [`AnyObj::obj_addr`], but the provenance is taken
+/// from the unique borrow itself.
+pub(crate) fn data_ptr_of_mut<T: Class, S: AnyObj + ?Sized>(src: &mut S) -> Option<*mut T> {
+    let entry = src.class_meta().find_base(TypeId::of::<T>())?;
+    let addr = src.obj_addr().addr();
+    let base: *mut u8 = (src as *mut S).cast();
+    // SAFETY: `addr` is the start of the very object `base` points at, so `with_addr` keeps the
+    // pointer inside its own allocation; `entry` came from that object's own metadata, so
+    // `data_offset` lands in bounds on its `T` subobject.
+    Some(unsafe { base.with_addr(addr).add(entry.data_offset).cast::<T>() })
+}
+
+/// Looks up the vtable that views `src`'s most-derived class through `T`'s interface.
+///
+/// `None` if `src` does not derive from `T`, or — only for an abstract class's own table, which a
+/// live object never has — if the entry records no vtable.
+pub(crate) fn dyn_vtable_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<VTablePtr> {
+    src.class_meta().find_base(TypeId::of::<T>())?.dyn_vtable
+}
+
 /// Builds a *polymorphic* pointer to `src` viewed as `T`'s interface.
 ///
 /// Note the deliberate absence of `data_offset`: Rust implements a `dyn` trait for the
 /// most-derived type, so the data half must keep addressing the complete object. Applying the
 /// offset here would silently dispatch to `T`'s own implementation instead of the override.
 pub(crate) fn dyn_ptr_of<T: Class, S: AnyObj + ?Sized>(src: &S) -> Option<*const T::Dyn> {
-    let entry = src.class_meta().find_base(TypeId::of::<T>())?;
-    // `None` only for an abstract class's own table, which a live object never has.
-    let vtable = entry.dyn_vtable?;
+    let vtable = dyn_vtable_of::<T, S>(src)?;
     // SAFETY: `vtable` was captured from this object's most-derived type coerced to `T::Dyn`, and
     // `obj_addr` is that object's address, so the pair is coherent.
     Some(unsafe { rebuild_fat::<T::Dyn>(src.obj_addr(), vtable) })
@@ -107,13 +129,15 @@ pub fn subobject<T: Class, S: AnyObj + ?Sized>(src: &S) -> &T {
 ///
 /// See [`subobject`].
 pub fn subobject_mut<T: Class, S: AnyObj + ?Sized>(src: &mut S) -> &mut T {
-    let ptr = data_ptr_of::<T, S>(src).unwrap_or_else(|| {
+    let found = data_ptr_of_mut::<T, S>(src);
+    let ptr = found.unwrap_or_else(|| {
         panic!(
             "obj: `{}` does not derive from `{}`",
             src.class_meta().name,
             T::META.name,
         )
     });
-    // SAFETY: as `subobject`, and `src` is borrowed uniquely for the returned lifetime.
-    unsafe { &mut *ptr.cast_mut() }
+    // SAFETY: as `subobject`, and `data_ptr_of_mut` carried the unique borrow's provenance
+    // through, so `src`'s uniqueness backs the returned reference for its whole lifetime.
+    unsafe { &mut *ptr }
 }

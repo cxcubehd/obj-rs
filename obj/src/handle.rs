@@ -13,7 +13,7 @@ use alloc::rc::{Rc, Weak as RcWeak};
 use alloc::sync::{Arc, Weak as ArcWeak};
 use core::ops::{Deref, DerefMut};
 
-use crate::cast::{data_ptr_of, dyn_ptr_of, is_a};
+use crate::cast::{data_ptr_of, data_ptr_of_mut, dyn_ptr_of, dyn_vtable_of, is_a, rebuild_fat};
 use crate::class::{Class, Concrete, SubclassOf};
 use crate::meta::ClassMeta;
 
@@ -90,11 +90,17 @@ impl<C: Class> Obj<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<Obj<T>, Self> {
-        let Some(ptr) = dyn_ptr_of::<T, _>(&*self.0) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        // Release ownership *before* rebuilding, so the object is never owned twice.
-        let _ = Box::into_raw(self.0);
+        // Release ownership *before* rebuilding, so the object is never owned twice — and rebuild
+        // from the raw pointer rather than from `obj_addr`, so the result inherits the
+        // allocation's own provenance instead of that of the shared borrow used for the lookup.
+        let raw: *mut C::Dyn = Box::into_raw(self.0);
+        // SAFETY: the data half of `raw` is the address of the complete object, which is what a
+        // polymorphic pointer must carry, and `vtable` was captured from that same most-derived
+        // type coerced to `T::Dyn`, so the pair is coherent.
+        let ptr: *const T::Dyn = unsafe { rebuild_fat(raw.cast::<u8>(), vtable) };
         // SAFETY: `ptr` addresses the very same allocation, and its vtable belongs to the same
         // most-derived type, so the size/align/drop recovered from it are the ones the allocation
         // was created with.
@@ -263,10 +269,10 @@ impl<'a, C: Class> RefMut<'a, C> {
     /// Mutably casts to the *data* view of another class in this object's hierarchy.
     #[must_use]
     pub fn cast_mut<T: Class>(self) -> Option<&'a mut T> {
-        // SAFETY: `data_ptr_of` returns an in-bounds pointer to the `T` subobject; `self` holds
-        // the unique borrow for `'a`, so handing out a unique reference to a subobject of it is
-        // sound.
-        data_ptr_of::<T, _>(self.0).map(|p| unsafe { &mut *p.cast_mut() })
+        // SAFETY: `data_ptr_of_mut` returns an in-bounds, writable pointer to the `T` subobject;
+        // `self` holds the unique borrow for `'a`, so handing out a unique reference to a
+        // subobject of it is sound.
+        data_ptr_of_mut::<T, _>(self.0).map(|p| unsafe { &mut *p })
     }
 }
 
@@ -343,10 +349,17 @@ impl<C: Class> Shared<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<Shared<T>, Self> {
-        let Some(ptr) = dyn_ptr_of::<T, _>(&*self.0) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        let _ = Rc::into_raw(self.0);
+        // As in `Obj::downcast`: rebuild from the pointer that owns the allocation, so the result
+        // does not inherit the read-only provenance of the borrow used for the lookup. `from_raw`
+        // needs to reach the reference counts that sit *before* the value, which a pointer derived
+        // from `&*self.0` has no provenance over.
+        let raw: *const C::Dyn = Rc::into_raw(self.0);
+        // SAFETY: the data half of `raw` addresses the complete object, and `vtable` was captured
+        // from that same most-derived type coerced to `T::Dyn`.
+        let ptr: *const T::Dyn = unsafe { rebuild_fat(raw.cast::<u8>(), vtable) };
         // SAFETY: `ptr` addresses the same allocation, and its vtable belongs to the same
         // most-derived type, so the layout recovered from it is the one the `Rc` was built with.
         Ok(Shared(unsafe { Rc::from_raw(ptr) }))
@@ -444,19 +457,17 @@ impl<C: Class> ArcShared<C> {
     ///
     /// Returns `Err(self)` if this object's most-derived class does not derive from `T`.
     pub fn downcast<T: Class>(self) -> Result<ArcShared<T>, Self> {
-        let meta = crate::class::AnyObj::class_meta(&*self.0);
-        let Some(entry) = meta.find_base(core::any::TypeId::of::<T>()) else {
+        let Some(vtable) = dyn_vtable_of::<T, _>(&*self.0) else {
             return Err(self);
         };
-        let Some(vtable) = entry.dyn_vtable else {
-            return Err(self);
-        };
-        let data = crate::class::AnyObj::obj_addr(&*self.0);
-        let _ = Arc::into_raw(self.0);
+        // As in `Shared::downcast`: the address has to come from the pointer that owns the
+        // allocation, not from a borrow of the value, because `from_raw` walks back to the
+        // reference counts stored ahead of it.
+        let raw: *const C::SendDyn = Arc::into_raw(self.0);
         // SAFETY: the rebuilt pointer addresses the same allocation and its vtable belongs to the
         // same most-derived type, so the layout `Arc::from_raw` recovers is the one the handle was
         // built with. `Send + Sync` carry over because the concrete type is unchanged.
-        let fat: *const T::SendDyn = unsafe { crate::cast::rebuild_fat(data, vtable) };
+        let fat: *const T::SendDyn = unsafe { rebuild_fat(raw.cast::<u8>(), vtable) };
         // SAFETY: as above.
         Ok(ArcShared(unsafe { Arc::from_raw(fat) }))
     }

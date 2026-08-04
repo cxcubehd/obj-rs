@@ -231,6 +231,42 @@ fn mutation_through_a_secondary_base_handle() {
     assert!((c.x - 3.0).abs() < EPS, "Shape::scale ran");
 }
 
+/// Writing a field through a handle goes through the generated `DerefMut`, which resolves the
+/// base's offset at runtime. Worth its own test under Miri: the pointer it hands back has to carry
+/// write provenance from the unique borrow, not read provenance from the metadata lookup.
+#[test]
+fn field_writes_through_a_handle_land_in_the_right_subobject() {
+    let mut c = Obj::<Circle>::new(Circle::make(1.0, 2.0, "c"));
+
+    // The primary base sits at offset 0...
+    c.x = 5.0;
+    assert!((c.x - 5.0).abs() < EPS, "wrote Shape::x");
+
+    // ...a secondary base does not, so this one also exercises the offset arithmetic.
+    let mut drawable: Obj<Drawable> = c.upcast();
+    drawable.visible = false;
+    assert!(!drawable.visible, "wrote Drawable::visible");
+
+    // The write landed in the one complete object, leaving its other subobjects alone.
+    let circle = drawable.borrow().cast::<Circle>().expect("is a Circle");
+    assert!((circle.r - 2.0).abs() < EPS, "Circle::r untouched");
+    assert!((drawable.borrow().cast::<Shape>().expect("is a Shape").x - 5.0).abs() < EPS);
+}
+
+#[test]
+fn mutable_cast_reaches_a_secondary_base_subobject() {
+    let mut c = Obj::<Circle>::new(Circle::make(1.0, 2.0, "c"));
+
+    let drawable: &mut Drawable = c
+        .borrow_mut()
+        .cast_mut::<Drawable>()
+        .expect("is a Drawable");
+    drawable.visible = false;
+
+    assert!(!c.as_drawable().visible, "mutation is visible through `c`");
+    assert!((c.r - 2.0).abs() < EPS, "and nothing else moved");
+}
+
 #[test]
 fn downcast_from_a_secondary_base_to_the_concrete_class() {
     let drawable: Obj<Drawable> = Obj::<Circle>::new(Circle::make(1.0, 2.0, "c")).upcast();
